@@ -6,7 +6,7 @@ SEED: 0
 HYP_TUNE: False
 
 # debugging
-DEBUG: False
+DEBUG: True
 
 # wandb params
 WANDB_MODE: "online"  # set to online to activate wandb
