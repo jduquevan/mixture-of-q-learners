@@ -19,6 +19,9 @@ REPLAY_START_SIZE: 128
 BATCH_SIZE: 128
 LAMBDA_N: 5
 NUM_AGENTS: 8
+MEMMAP_DIR: "/home/mila/j/juan.duque/scratch/purejaxql/rb"
+TRAINING_ITERATIONS: 1e9
+MINIBATCH_SIZE: 128
 
 # env specific, see https://envpool.readthedocs.io/en/latest/env/atari.html
 ENV_NAME: "Pong-v5"

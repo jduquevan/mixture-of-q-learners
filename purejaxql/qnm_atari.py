@@ -7,6 +7,8 @@ from typing import Any
 from flax import struct
 from flax.training.train_state import TrainState
 import optax
+import os
+import uuid
 
 import flax.linen as nn
 import hydra
@@ -223,60 +225,249 @@ class QNetwork(nn.Module):
         q_values = nn.Dense(features=self.action_dim, kernel_init=nn.initializers.kaiming_normal())(x)
         return q_values
 
-def replay_buffer_push(rb: ReplayBufferState,
-                       obs: jnp.ndarray,
-                       actions: jnp.ndarray,
-                       rewards: jnp.ndarray,
-                       dones: jnp.ndarray,
-                       next_obs: jnp.ndarray):
-    obs = jnp.transpose(obs, (1, 0) + tuple(range(2, obs.ndim)))
-    actions = jnp.transpose(actions, (1, 0))
-    rewards = jnp.transpose(rewards, (1, 0))
-    dones = jnp.transpose(dones, (1, 0))
-    next_obs = jnp.transpose(next_obs, (1, 0) + tuple(range(2, next_obs.ndim)))
-    batch_size = obs.shape[0]
-    indices = (rb.idx + jnp.arange(batch_size)) % rb.capacity
-    def scatter(arr, update, idxs):
-         return arr.at[idxs].set(update)
-    new_obs      = scatter(rb.obs, obs, indices)
-    new_actions  = scatter(rb.actions, actions, indices)
-    new_rewards  = scatter(rb.rewards, rewards, indices)
-    new_dones    = scatter(rb.dones, dones, indices)
-    new_next_obs = scatter(rb.next_obs, next_obs, indices)
-    new_idx = (rb.idx + batch_size) % rb.capacity
-    new_size = jnp.minimum(rb.size + batch_size, rb.capacity)
-    return rb.replace(
-         obs=new_obs,
-         actions=new_actions,
-         rewards=new_rewards,
-         dones=new_dones,
-         next_obs=new_next_obs,
-         idx=new_idx,
-         size=new_size,
-    )
+@struct.dataclass
+class DiskTransition:
+    """
+    Separate dataclass to store transitions for the disk + GPU buffer.
+    (Doesn't store q_val by default; adapt as needed.)
+    """
+    obs: jnp.ndarray
+    action: jnp.ndarray
+    reward: jnp.ndarray
+    done: jnp.ndarray
+    next_obs: jnp.ndarray
 
-def replay_buffer_sample(rb: ReplayBufferState, rng: jax.random.PRNGKey, batch_size: int):
-    max_idx = rb.size
-    idxs = jax.random.randint(rng, shape=(batch_size,), minval=0, maxval=max_idx)
-    batch_obs      = rb.obs[idxs]
-    batch_actions  = rb.actions[idxs]
-    batch_rewards  = rb.rewards[idxs]
-    batch_dones    = rb.dones[idxs]
-    batch_next_obs = rb.next_obs[idxs]
-    batch_obs = jnp.transpose(batch_obs, (1, 0) + tuple(range(2, batch_obs.ndim)))
-    batch_actions = jnp.transpose(batch_actions, (1, 0))
-    batch_rewards = jnp.transpose(batch_rewards, (1, 0))
-    batch_dones = jnp.transpose(batch_dones, (1, 0))
-    batch_next_obs = jnp.transpose(batch_next_obs, (1, 0) + tuple(range(2, batch_next_obs.ndim)))
-    return batch_obs, batch_actions, batch_rewards, batch_dones, batch_next_obs
+def get_memmap_dir(config):
+    """
+    Returns a unique directory for memmap replay data.
+    If WANDB is enabled and we have a wandb.run, we use wandb.run.id.
+    Otherwise, we generate a random UUID.
+    """
+    base = config['alg']['MEMMAP_DIR'] # The base path from config, default "."
 
-def eps_greedy_exploration(rng, q_vals, eps):
-    a_greedy = jnp.argmax(q_vals, -1)
-    explore = jax.random.uniform(rng) < eps
-    a_random = jax.random.randint(rng, (), 0, q_vals.shape[-1])
-    return jnp.where(explore, a_random, a_greedy)
+    if config["WANDB_MODE"] != "disabled" and wandb.run is not None:
+        # If W&B is actually running, wandb.run.id is something like '1abc234'
+        run_id = wandb.run.id
+        return os.path.join(base, run_id)
+    else:
+        # If W&B is disabled or wandb.run not present, use a random subdirectory
+        random_id = str(uuid.uuid4())
+        return os.path.join(base, random_id)
 
-def step_env(carry, _, train_states, network, env, config, eps_scheduler):
+class DiskGPUMixedReplayBuffer:
+    """
+    A replay buffer that:
+      - Stores the entire buffer on disk (via np.memmap).
+      - Uses a small 'mini-buffer' on GPU with shape (mini_buffer_size, N, *obs_shape).
+      - Inserts "blocks" of shape (B, N, *obs_shape) at once.
+      - Reads the same shape (B, N, *obs_shape) at once when sampling.
+    """
+
+    def __init__(
+        self,
+        capacity: int,
+        mini_buffer_size: int,
+        n_agents: int,            # <--- new argument for N
+        obs_shape: tuple,
+        memmap_dir: str,
+        obs_dtype=np.uint8,
+        reward_dtype=np.float32,
+        action_dtype=np.int32,
+    ):
+        os.makedirs(memmap_dir, exist_ok=True)
+        mode = "w+"
+
+        self.capacity = capacity   # how many "slots" in the ring
+        self.mini_buffer_size = mini_buffer_size
+        self.n_agents = n_agents
+        self.obs_shape = obs_shape
+
+        # On-disk arrays. We'll store shape: (capacity, N, *obs_shape)
+        self.obs_memmap_path      = os.path.join(memmap_dir, "obs.dat")
+        self.next_obs_memmap_path = os.path.join(memmap_dir, "next_obs.dat")
+        self.actions_memmap_path  = os.path.join(memmap_dir, "actions.dat")
+        self.rewards_memmap_path  = os.path.join(memmap_dir, "rewards.dat")
+        self.dones_memmap_path    = os.path.join(memmap_dir, "dones.dat")
+
+        self.obs_memmap = np.memmap(
+            self.obs_memmap_path,
+            mode=mode, dtype=obs_dtype,
+            shape=(capacity, n_agents) + obs_shape
+        )
+        self.next_obs_memmap = np.memmap(
+            self.next_obs_memmap_path,
+            mode=mode, dtype=obs_dtype,
+            shape=(capacity, n_agents) + obs_shape
+        )
+        self.actions_memmap = np.memmap(
+            self.actions_memmap_path,
+            mode=mode, dtype=action_dtype,
+            shape=(capacity, n_agents)
+        )
+        self.rewards_memmap = np.memmap(
+            self.rewards_memmap_path,
+            mode=mode, dtype=reward_dtype,
+            shape=(capacity, n_agents)
+        )
+        self.dones_memmap = np.memmap(
+            self.dones_memmap_path,
+            mode=mode, dtype=np.bool_,
+            shape=(capacity, n_agents)
+        )
+
+        self.disk_size = 0
+        self.disk_idx  = 0
+
+        # -- GPU mini-buffer arrays: shape (mini_buffer_size, N, *obs_shape)
+        self.obs_gpu      = jnp.zeros((mini_buffer_size, n_agents) + obs_shape, dtype=obs_dtype)
+        self.next_obs_gpu = jnp.zeros((mini_buffer_size, n_agents) + obs_shape, dtype=obs_dtype)
+        self.actions_gpu  = jnp.zeros((mini_buffer_size, n_agents), dtype=action_dtype)
+        self.rewards_gpu  = jnp.zeros((mini_buffer_size, n_agents), dtype=reward_dtype)
+        self.dones_gpu    = jnp.zeros((mini_buffer_size, n_agents), dtype=bool)
+
+        self.mb_read_idx = 0  # next free slot for writing (or next read offset)
+
+    def _host_to_device(self, obs_np, next_obs_np, act_np, rew_np, done_np):
+        return (
+            jnp.array(obs_np),
+            jnp.array(next_obs_np),
+            jnp.array(act_np),
+            jnp.array(rew_np),
+            jnp.array(done_np)
+        )
+
+    def _device_to_host(self, obs_j, next_obs_j, act_j, rew_j, done_j):
+        return (
+            np.array(obs_j, copy=False),
+            np.array(next_obs_j, copy=False),
+            np.array(act_j, copy=False),
+            np.array(rew_j, copy=False),
+            np.array(done_j, copy=False),
+        )
+
+    def push_block(self, obs_block, next_obs_block, act_block, rew_block, done_block):
+        """
+        Insert a "block" of shape (B, N, ...) into the GPU mini-buffer at [mb_read_idx : mb_read_idx + B].
+        If it overflows, we flush to disk, reset to 0, then insert.
+        """
+        B = obs_block.shape[0]
+        start_idx = self.mb_read_idx
+        end_idx   = start_idx + B
+
+        if end_idx > self.mini_buffer_size:
+            # flush to disk
+            self.flush_gpu_to_disk()
+            self.mb_read_idx = 0
+            start_idx = 0
+            end_idx   = B
+
+        self.obs_gpu      = self.obs_gpu.at[start_idx:end_idx].set(obs_block)
+        self.next_obs_gpu = self.next_obs_gpu.at[start_idx:end_idx].set(next_obs_block)
+        self.actions_gpu  = self.actions_gpu.at[start_idx:end_idx].set(act_block)
+        self.rewards_gpu  = self.rewards_gpu.at[start_idx:end_idx].set(rew_block)
+        self.dones_gpu    = self.dones_gpu.at[start_idx:end_idx].set(done_block)
+
+        self.mb_read_idx = end_idx
+
+    def sample_block(self, B: int):
+        """
+        Return a block of shape (B, N, ...) from the GPU mini-buffer, starting at mb_read_idx.
+        If we don't have B items left, flush & refill from disk, then read from 0.
+        """
+        start_idx = self.mb_read_idx
+        end_idx   = start_idx + B
+
+        if end_idx > self.mini_buffer_size:
+            # flush to disk & refill
+            self.flush_gpu_to_disk()
+            self.refill_from_disk(start_idx=0, count=None)
+            self.mb_read_idx = 0
+            start_idx = 0
+            end_idx   = B
+
+        obs_block      = self.obs_gpu     [start_idx:end_idx]
+        next_obs_block = self.next_obs_gpu[start_idx:end_idx]
+        act_block      = self.actions_gpu [start_idx:end_idx]
+        rew_block      = self.rewards_gpu [start_idx:end_idx]
+        done_block     = self.dones_gpu   [start_idx:end_idx]
+
+        self.mb_read_idx = end_idx
+
+        return obs_block, next_obs_block, act_block, rew_block, done_block
+
+    def flush_gpu_to_disk(self, start_disk_idx=None, count=None):
+        """
+        Bulk-write [0 : self.mb_read_idx] from GPU arrays => disk arrays.
+        Usually called if the ring is full or if we want to persist data.
+        """
+        if start_disk_idx is None:
+            start_disk_idx = self.disk_idx
+        if count is None:
+            count = self.mb_read_idx
+
+        end_disk_idx = start_disk_idx + count
+        if end_disk_idx > self.capacity:
+            raise ValueError("Not enough capacity on disk to flush block. Handle ring or bigger capacity.")
+
+        # device -> host
+        obs_np, next_obs_np, act_np, rew_np, done_np = self._device_to_host(
+            self.obs_gpu[:count],
+            self.next_obs_gpu[:count],
+            self.actions_gpu[:count],
+            self.rewards_gpu[:count],
+            self.dones_gpu[:count],
+        )
+
+        # write to memmap
+        self.obs_memmap[start_disk_idx : end_disk_idx]      = obs_np
+        self.next_obs_memmap[start_disk_idx : end_disk_idx] = next_obs_np
+        self.actions_memmap[start_disk_idx : end_disk_idx]  = act_np
+        self.rewards_memmap[start_disk_idx : end_disk_idx]  = rew_np
+        self.dones_memmap[start_disk_idx : end_disk_idx]    = done_np
+
+        self.disk_size = max(self.disk_size, end_disk_idx)
+        self.disk_idx  = end_disk_idx
+        self.mb_read_idx = 0  # we've "consumed" them from the mini-buffer
+
+    def refill_from_disk(self, start_idx=0, count=None):
+        """
+        Bulk-read from disk => GPU mini-buffer [0..count], overwriting what's there.
+        Typically for sampling older transitions, if you want that flow.
+        """
+        if count is None:
+            count = self.mini_buffer_size
+        available = self.disk_size - start_idx
+        if available <= 0:
+            return  # nothing
+
+        count = min(count, available)
+        end_idx = start_idx + count
+
+        # read from memmap
+        obs_np      = self.obs_memmap     [start_idx : end_idx]
+        next_obs_np = self.next_obs_memmap[start_idx : end_idx]
+        act_np      = self.actions_memmap [start_idx : end_idx]
+        rew_np      = self.rewards_memmap [start_idx : end_idx]
+        done_np     = self.dones_memmap   [start_idx : end_idx]
+
+        # host -> device
+        obs_j, next_obs_j, act_j, rew_j, done_j = self._host_to_device(
+            obs_np, next_obs_np, act_np, rew_np, done_np
+        )
+
+        # store to GPU
+        self.obs_gpu      = self.obs_gpu.at[:count].set(obs_j)
+        self.next_obs_gpu = self.next_obs_gpu.at[:count].set(next_obs_j)
+        self.actions_gpu  = self.actions_gpu.at[:count].set(act_j)
+        self.rewards_gpu  = self.rewards_gpu.at[:count].set(rew_j)
+        self.dones_gpu    = self.dones_gpu.at[:count].set(done_j)
+
+        self.mb_read_idx = 0  # we can now read from slot 0
+
+    def __len__(self):
+        return self.disk_size
+
+def step_env(carry, _, agent_train_states, network, env, config, eps_scheduler):
     # carry: (last_obs, env_state, rng)
     # last_obs: (N, E, obs_shape)
     # env_state: each field (N, E, ...)
@@ -287,20 +478,32 @@ def step_env(carry, _, train_states, network, env, config, eps_scheduler):
     new_rng = rng_split[:, 0, :]
     rng_a   = rng_split[:, 1, :]
     _rng_extra = rng_split[:, 2, :]
+
     def agent_apply(ts, obs):
         return network.apply({"params": ts.params, "batch_stats": ts.batch_stats}, obs, train=False)
-    q_vals = jax.vmap(agent_apply)(train_states, last_obs)  # (N, E, action_dim)
-    eps_value = eps_scheduler(train_states.n_updates[0])
+    q_vals = jax.vmap(agent_apply)(agent_train_states, last_obs)  # (N, E, action_dim)
+
+    eps_value = eps_scheduler(agent_train_states.n_updates[0])
     eps = jnp.full((N, E), eps_value)
+
     rngs = jax.vmap(lambda key: jax.random.split(key, E))(rng_a)  # (N, E, key_size)
+    def eps_greedy_exploration(rn, q_vals_, eps_):
+        a_greedy = jnp.argmax(q_vals_, -1)
+        explore = jax.random.uniform(rn) < eps_
+        a_random = jax.random.randint(rn, (), 0, q_vals_.shape[-1])
+        return jnp.where(explore, a_random, a_greedy)
+
     def compute_actions(q, keys, eps_row):
         return jax.vmap(eps_greedy_exploration)(keys, q, eps_row)
     new_action = jax.vmap(compute_actions)(q_vals, rngs, eps)  # (N, E)
+
     def merge_axes(x):
         return x.reshape(N * E, *x.shape[2:])
     merged_env_state = jax.tree_map(merge_axes, env_state)
     merged_action = new_action.reshape(-1)
+
     merged_obs, merged_env_state_out, merged_reward, merged_done, merged_info = env.step(merged_env_state, merged_action)
+
     def split_axes(x):
         return x.reshape(N, E, *x.shape[1:])
     new_obs = jax.tree_map(split_axes, merged_obs)
@@ -308,6 +511,7 @@ def step_env(carry, _, train_states, network, env, config, eps_scheduler):
     reward = split_axes(merged_reward)
     done = split_axes(merged_done)
     info = jax.tree_map(split_axes, merged_info)
+
     transition = Transition(
         obs=last_obs,
         action=new_action,
@@ -390,40 +594,217 @@ def initialize_agents(config, env, rng):
     batched_train_states = vectorized_create_agent(rngs)
     return batched_train_states
 
+def qnm_algorithm(
+    config,
+    agent_train_states,
+    disk_replay_buffer,  # new DiskGPUMixedReplayBuffer with (mini_buffer_size, N, ...)
+    network,
+    rng,
+    env,
+    eps_scheduler,
+    batched_init_obs,     # shape (N, E, obs_shape)
+    batched_env_state,    # shape (N, E, ...)
+):
+    """
+    1) Generate a trajectory with shape (NUM_STEPS, N, E, ...).
+    2) For each time-step t, transpose from (N,E,...) to (B=N, E=..., or B=E, N=..., whichever you prefer).
+       We'll call the environment dimension 'B' and keep the agent dimension 'N'.
+    3) Push that (B, N, ...) block into the mini-buffer with disk_replay_buffer.push_block(...).
+    4) We can gather a block of size 'count' from the mini-buffer by using disk_replay_buffer.sample_block(count).
+    5) Apply updates with vmap.
+    6) Log metrics per agent.
+    """
+
+    num_agents = config['alg']['NUM_AGENTS']
+    gamma = config['alg'].get('GAMMA', 0.99)
+    lam   = config['alg'].get('LAMBDA', 1.0)
+
+    # 1) Generate trajectory => shape (NUM_STEPS, N, E, obs_shape)
+    (next_obs, next_env_state, _), (transitions, infos) = generate_trajectory(
+        network,
+        agent_train_states,
+        config,
+        env,
+        batched_init_obs,
+        batched_env_state,
+        rng,
+        eps_scheduler,
+    )
+
+    n_steps = transitions.obs.shape[0]     # total steps
+    # transitions.obs[t] => shape (N, E, obs_shape)
+
+    # 2) We'll define a small "per_agent_td_loss" + "agent_loss_and_grad" for the update:
+    def per_agent_td_loss(p, bs, obs, next_obs, act, rew, done):
+        """
+        obs, next_obs => (batch_size, obs_shape) for that agent
+        But now batch_size = B
+        """
+        gamma = config['alg']["GAMMA"]
+        q_vals, updates = network.apply(
+            {"params": p, "batch_stats": bs},
+            obs,
+            train=True,
+            mutable=["batch_stats"]
+        )
+        chosen_q = jnp.take_along_axis(
+            q_vals, jnp.expand_dims(act, axis=-1), axis=-1
+        ).squeeze(-1)
+
+        next_q_vals = network.apply({"params": p, "batch_stats": bs}, next_obs, train=False)
+        max_next_q = jnp.max(next_q_vals, axis=-1)
+        td_target = rew + gamma * (1.0 - done) * max_next_q
+        loss = 0.5 * jnp.mean((chosen_q - td_target) ** 2)
+        return loss, updates
+
+    def agent_loss_and_grad(params, bs, obs, nobs, act, rew, done):
+        (loss_val, updates), grads = jax.value_and_grad(
+            lambda pp: per_agent_td_loss(pp, bs, obs, nobs, act, rew, done),
+            has_aux=True
+        )(params)
+        return loss_val, (updates["batch_stats"], grads)
+
+    # 3) For each time-step, transpose from (N, E, ...) => (B=E, N, ...)
+    #    Then push the entire block to the mini-buffer.
+    for t in range(n_steps):
+        # transitions.obs[t] => shape (N, E, obs_shape).
+        obs_t = jnp.transpose(transitions.obs[t], (1, 0, *range(2, transitions.obs[t].ndim)))  # (E, N, *obs_shape)
+        nxt_t = jnp.transpose(transitions.next_obs[t], (1, 0, *range(2, transitions.next_obs[t].ndim)))  # (E, N, ...)
+        act_t = jnp.transpose(transitions.action[t],   (1, 0)) # => (E, N)
+        rew_t = jnp.transpose(transitions.reward[t],   (1, 0)) # => (E, N)
+        don_t = jnp.transpose(transitions.done[t],     (1, 0)) # => (E, N)
+
+        disk_replay_buffer.push_block(obs_t, nxt_t, act_t, rew_t, don_t)
+
+    # 4) Optionally, sample a block for training
+    if disk_replay_buffer.disk_size < config["alg"].get("MIN_DISK_SIZE", 1):
+        print("Not enough transitions on disk yet. Skipping update.")
+        return agent_train_states, rng
+
+    batch_size = config["alg"].get("MINIBATCH_SIZE", 128) 
+    obs_block, next_obs_block, act_block, rew_block, done_block = disk_replay_buffer.sample_block(batch_size)
+
+    # 5) Perform a per-agent update. We want shape => (num_agents, batch_size, ...) for input
+    obs_trans  = jnp.transpose(obs_block,  (1, 0, *range(2, obs_block.ndim)))
+    next_trans = jnp.transpose(next_obs_block, (1, 0, *range(2, next_obs_block.ndim)))
+    act_trans  = jnp.transpose(act_block,  (1, 0))   # => (N, batch_size)
+    rew_trans  = jnp.transpose(rew_block,  (1, 0))
+    don_trans  = jnp.transpose(done_block, (1, 0))
+
+    loss_vals, (new_bstats, grads_all) = jax.vmap(agent_loss_and_grad, in_axes=(0, 0, 0, 0, 0, 0, 0))(
+        agent_train_states.params,
+        agent_train_states.batch_stats,
+        obs_trans,      # shape => (N, batch_size, *obs_shape)
+        next_trans,
+        act_trans,
+        rew_trans,
+        don_trans,
+    )
+
+    def agent_opt_update(p, g, st):
+        updates, new_st = agent_train_states.tx.update(g, st, p)
+        new_p = optax.apply_updates(p, updates)
+        return new_p, new_st
+
+    new_params, new_opt_states = jax.vmap(agent_opt_update, in_axes=(0, 0, 0))(
+        agent_train_states.params,
+        grads_all,
+        agent_train_states.opt_state
+    )
+
+    agent_train_states = agent_train_states.replace(
+        params=new_params,
+        batch_stats=new_bstats,
+        opt_state=new_opt_states,
+        n_updates=agent_train_states.n_updates + 1
+    )
+
+    # 6) Logging
+    for i in range(num_agents):
+        wandb.log({
+            f"agent_{i}/loss": loss_vals[i],
+            f"agent_{i}/updates": int(agent_train_states.n_updates[i]),
+        }, step=int(agent_train_states.n_updates[i]))
+
+    return agent_train_states, rng
+
 @hydra.main(version_base=None, config_path="./config", config_name="config")
 def main(config):
     config = OmegaConf.to_container(config)
     print("Config:\n", OmegaConf.to_yaml(config))
     if config["DEBUG"]:
         jax.config.update("jax_disable_jit", True)
+
     rng = jax.random.PRNGKey(config["SEED"])
     num_agents = config['alg']["NUM_AGENTS"]
-    # E: number of environments per agent.
     E = config['alg']["NUM_ENVS"]
     total_envs = num_agents * E
+    agent_rngs = jax.random.split(rng, num_agents)
+
+    # 1) Create environment
     env = make_env(total_envs, config)
-    init_obs, env_state = env.reset()  # init_obs: (total_envs, 4, 84, 84)
+    init_obs, env_state = env.reset() 
     batched_init_obs = init_obs.reshape(num_agents, E, *init_obs.shape[1:])
     batched_env_state = jax.tree_map(lambda x: x.reshape(num_agents, E, *x.shape[1:]), env_state)
-    eps_scheduler = optax.linear_schedule(
-        init_value=config['alg']["EPS_START"],
-        end_value=config['alg']["EPS_FINISH"],
-        transition_steps=int(config['alg']["TOTAL_TIMESTEPS_DECAY"] * config['alg']["EPS_DECAY"]),
-    )
+
+    # 2) Create the QNetwork + agent_train_states
     network = QNetwork(
         action_dim=env.single_action_space.n,
         norm_type=config['alg']["NORM_TYPE"],
         norm_input=config.get("NORM_INPUT", False),
     )
     agent_train_states = initialize_agents(config, env, rng)
-    agent_rngs = jax.random.split(rng, num_agents)
-    final_carry, (transitions, infos) = generate_trajectory(
-        network, agent_train_states, config, env,
-        batched_init_obs, batched_env_state, agent_rngs, eps_scheduler
+
+    # 3) Create the replay buffer
+    memmap_dir = get_memmap_dir(config)
+    disk_replay_buffer = DiskGPUMixedReplayBuffer(
+        capacity=10_000_000,              
+        mini_buffer_size=512,          
+        n_agents=num_agents,
+        obs_shape=(4, 84, 84),         
+        memmap_dir=memmap_dir,  
     )
-    print("Generated trajectory shapes:")
-    print(jax.tree_map(lambda x: x.shape, transitions))
-    print("Train method completed.")
+
+    # 4) Epsilon schedule
+    eps_scheduler = optax.linear_schedule(
+        init_value=config['alg']["EPS_START"],
+        end_value=config['alg']["EPS_FINISH"],
+        transition_steps=int(config['alg']["TOTAL_TIMESTEPS_DECAY"] * config['alg']["EPS_DECAY"]),
+    )
+
+    alg_name = config.get("ALG_NAME", "qnm")
+    env_name = config.get("ENV_NAME", "NAN")
+
+    wandb.init(
+        entity=config["ENTITY"],
+        project=config["PROJECT"],
+        tags=[
+            alg_name.upper(),
+            env_name.upper(),
+            f"jax_{jax.__version__}",
+        ],
+        name=f"{alg_name}_{env_name}",
+        config=config,
+        mode=config["WANDB_MODE"],
+    )
+
+    # 5) Short training loop
+    for iteration in range(int(config['alg']["TRAINING_ITERATIONS"])):
+        # call qnm_algorithm once (generates a trajectory, pushes to replay, samples & updates)
+        agent_train_states, rng = qnm_algorithm(
+            config,
+            agent_train_states,
+            disk_replay_buffer,
+            network,
+            agent_rngs,
+            env,
+            eps_scheduler,
+            batched_init_obs,
+            batched_env_state
+        )
+        print(f"Iteration {iteration} complete. Disk buffer size={len(disk_replay_buffer)}")
+
+    print("Done training.")
 
 if __name__ == "__main__":
     main()
