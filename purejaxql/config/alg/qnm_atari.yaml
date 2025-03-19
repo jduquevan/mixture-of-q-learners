@@ -1,7 +1,7 @@
 ALG_NAME: "pqn"
 TOTAL_TIMESTEPS: 5e7 # with 4 frame skip correpsnds to 200M frames
 TOTAL_TIMESTEPS_DECAY: 5e7 # will be used for decay functions (epsilon and lr)
-NUM_ENVS: 16 # parallel environments PER agent
+NUM_ENVS: 128 # parallel environments PER agent
 NUM_STEPS: 32 # steps per environment in each update
 EPS_START: 1.
 EPS_FINISH: 0.001
@@ -22,7 +22,10 @@ NUM_AGENTS: 8
 MEMMAP_DIR: "/home/mila/j/juan.duque/scratch/purejaxql/rb"
 TRAINING_ITERATIONS: 1e9
 MINIBATCH_SIZE: 32
+MINI_BUFFER_SIZE: 1
 NSTEP: 32
+EVAL_STEPS: 32
+EVAL_EVERY: 1
 
 # env specific, see https://envpool.readthedocs.io/en/latest/env/atari.html
 ENV_NAME: "Pong-v5"
@@ -36,4 +39,5 @@ ENV_KWARGS:
 # evaluation
 TEST_DURING_TRAINING: True 
 TEST_ENVS: 8
-EPS_TEST: 0. # 0 for greedy test policy
+
+SKIP_REPLAY_BUFFER: True

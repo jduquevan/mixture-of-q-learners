@@ -468,63 +468,66 @@ class DiskGPUMixedReplayBuffer:
     def __len__(self):
         return self.disk_size
 
-def step_env(carry, _, agent_train_states, network, env, eps_scheduler):
-    # carry: (last_obs, env_state, rng)
-    # last_obs: (N, E, obs_shape)
-    # env_state: each field (N, E, ...)
-    # rng: (N, key_size)
-    last_obs, env_state, rng = carry
-    N, E = last_obs.shape[:2]
-    rng_split = jax.vmap(lambda key: jax.random.split(key, 3))(rng)  # (N, 3, key_size)
-    new_rng = rng_split[:, 0, :]
-    rng_a   = rng_split[:, 1, :]
-    _rng_extra = rng_split[:, 2, :]
-
-    def agent_apply(ts, obs):
-        return network.apply({"params": ts.params, "batch_stats": ts.batch_stats}, obs, train=False)
-    q_vals = jax.vmap(agent_apply)(agent_train_states, last_obs)  # (N, E, action_dim)
-
-    eps_value = eps_scheduler(agent_train_states.n_updates[0])
-    eps = jnp.full((N, E), eps_value)
-
-    rngs = jax.vmap(lambda key: jax.random.split(key, E))(rng_a)  # (N, E, key_size)
-    def eps_greedy_exploration(rn, q_vals_, eps_):
-        a_greedy = jnp.argmax(q_vals_, -1)
-        explore = jax.random.uniform(rn) < eps_
-        a_random = jax.random.randint(rn, (), 0, q_vals_.shape[-1])
-        return jnp.where(explore, a_random, a_greedy)
-
-    def compute_actions(q, keys, eps_row):
-        return jax.vmap(eps_greedy_exploration)(keys, q, eps_row)
-    new_action = jax.vmap(compute_actions)(q_vals, rngs, eps)  # (N, E)
-
-    def merge_axes(x):
-        return x.reshape(N * E, *x.shape[2:])
-    merged_env_state = jax.tree_map(merge_axes, env_state)
-    merged_action = new_action.reshape(-1)
-
-    merged_obs, merged_env_state_out, merged_reward, merged_done, merged_info = env.step(merged_env_state, merged_action)
-
-    def split_axes(x):
-        return x.reshape(N, E, *x.shape[1:])
-    new_obs = jax.tree_map(split_axes, merged_obs)
-    new_env_state = jax.tree_map(split_axes, merged_env_state_out)
-    reward = split_axes(merged_reward)
-    done = split_axes(merged_done)
-    info = jax.tree_map(split_axes, merged_info)
-
-    transition = Transition(
-        obs=last_obs,
-        action=new_action,
-        reward=reward,
-        done=done,
-        next_obs=new_obs,
-        q_val=q_vals,
-    )
-    return (new_obs, new_env_state, new_rng), (transition, info)
+def constant_zero_eps_scheduler(_):
+    return 0.0
 
 @partial(jax.jit, static_argnums=(0, 2, 3, 7))
 def generate_trajectory(network, train_states, num_steps, env, init_obs, env_state, rng, eps_scheduler):
+    def step_env(carry, _, agent_train_states, network, env, eps_scheduler):
+        # carry: (last_obs, env_state, rng)
+        # last_obs: (N, E, obs_shape)
+        # env_state: each field (N, E, ...)
+        # rng: (N, key_size)
+        last_obs, env_state, rng = carry
+        N, E = last_obs.shape[:2]
+        rng_split = jax.vmap(lambda key: jax.random.split(key, 3))(rng)  # (N, 3, key_size)
+        new_rng = rng_split[:, 0, :]
+        rng_a   = rng_split[:, 1, :]
+        _rng_extra = rng_split[:, 2, :]
+
+        def agent_apply(ts, obs):
+            return network.apply({"params": ts.params, "batch_stats": ts.batch_stats}, obs, train=False)
+        q_vals = jax.vmap(agent_apply)(agent_train_states, last_obs)  # (N, E, action_dim)
+
+        eps_value = eps_scheduler(agent_train_states.n_updates[0])
+        eps = jnp.full((N, E), eps_value)
+
+        rngs = jax.vmap(lambda key: jax.random.split(key, E))(rng_a)  # (N, E, key_size)
+        def eps_greedy_exploration(rn, q_vals_, eps_):
+            a_greedy = jnp.argmax(q_vals_, -1)
+            explore = jax.random.uniform(rn) < eps_
+            a_random = jax.random.randint(rn, (), 0, q_vals_.shape[-1])
+            return jnp.where(explore, a_random, a_greedy)
+
+        def compute_actions(q, keys, eps_row):
+            return jax.vmap(eps_greedy_exploration)(keys, q, eps_row)
+        new_action = jax.vmap(compute_actions)(q_vals, rngs, eps)  # (N, E)
+
+        def merge_axes(x):
+            return x.reshape(N * E, *x.shape[2:])
+        merged_env_state = jax.tree_map(merge_axes, env_state)
+        merged_action = new_action.reshape(-1)
+
+        merged_obs, merged_env_state_out, merged_reward, merged_done, merged_info = env.step(merged_env_state, merged_action)
+
+        def split_axes(x):
+            return x.reshape(N, E, *x.shape[1:])
+        new_obs = jax.tree_map(split_axes, merged_obs)
+        new_env_state = jax.tree_map(split_axes, merged_env_state_out)
+        reward = split_axes(merged_reward)
+        done = split_axes(merged_done)
+        info = jax.tree_map(split_axes, merged_info)
+
+        transition = Transition(
+            obs=last_obs,
+            action=new_action,
+            reward=reward,
+            done=done,
+            next_obs=new_obs,
+            q_val=q_vals,
+        )
+        return (new_obs, new_env_state, new_rng), (transition, info)
+
     # init_obs: (N, E, obs_shape), env_state: (N, E, ...), rng: (N, key_size)
     init_carry = (init_obs, env_state, rng)
     final_carry, (transitions, infos) = jax.lax.scan(
@@ -700,66 +703,115 @@ def qnm_algorithm(
     eps_scheduler,
     batched_init_obs,
     batched_env_state,
+    eval_env=None,          
+    current_iter=0,   
 ):
     """
-    Runs one iteration of the algorithm:
-      - Generates a trajectory using the current policy.
-      - Logs per-agent environment metrics.
-      - Pushes transitions into a replay buffer.
-      - Samples a minibatch and performs an update using TD(λ) targets.
+    Runs one iteration of the QNM algorithm:
+      - Generates a training trajectory using the current (exploratory) policy.
+      - Computes per-agent training metrics and uses transitions to update the network.
+      - If an evaluation environment is provided and current_iter is a multiple of EVAL_EVERY,
+        performs a rollout on the evaluation environment using greedy (ε=0) actions,
+        and logs per-agent evaluation metrics.
     
-    Uses the lambda parameter ("LAMBDA" in config) for TD(λ) returns.
+    TD(λ) targets are computed using the lambda parameter ("LAMBDA" in config).
     """
     N = config['alg']['NUM_AGENTS']
     S = config['alg']['NUM_STEPS']
     gamma = config['alg'].get('GAMMA', 0.99)
-    lam = config['alg'].get('LAMBDA', 0.9)  # TD(λ) parameter
+    lam = config['alg'].get('LAMBDA', 0.9)
 
+    # --- Training Rollout ---
     (next_obs, next_env_state, _), (transitions, infos) = generate_trajectory(
         network,
         agent_train_states,
-        S,
+        config['alg']['NUM_STEPS'],
         env,
         batched_init_obs,
         batched_env_state,
         rng,
         eps_scheduler,
     )
-
-    # Compute per-agent metrics (infos shape assumed to be (env_steps, num_agents, batch_size)).
+    
+    qvals = jnp.mean(
+        jnp.take_along_axis(transitions.q_val, transitions.action[..., None], axis=-1).squeeze(-1),
+        axis=(0, 2)
+    )
     metrics = {k: jnp.mean(v, axis=(0, 2)) for k, v in infos.items()}
     metrics_np = {k: np.array(val) for k, val in metrics.items()}
-    for i in range(N):
+    for i in range(config['alg']['NUM_AGENTS']):
         agent_metrics = {k: float(metrics_np[k][i]) for k in metrics_np}
-        wandb.log({f"agent_{i}/env_metrics": agent_metrics}, step=int(agent_train_states.n_updates[i]))
+        wandb.log({f"agent_{i}/env_metrics": agent_metrics},
+                  step=int(agent_train_states.n_updates[i]))
 
-    # Rearrange transitions to shape (B, N, S, ...).
+    # Rearrange transitions into blocks of shape (B, N, S, ...)
     obs_block  = jnp.transpose(transitions.obs,      (2, 1, 0) + tuple(range(3, transitions.obs.ndim)))
     next_block = jnp.transpose(transitions.next_obs, (2, 1, 0) + tuple(range(3, transitions.next_obs.ndim)))
     act_block  = jnp.transpose(transitions.action,   (2, 1, 0))
     rew_block  = jnp.transpose(transitions.reward,   (2, 1, 0))
     don_block  = jnp.transpose(transitions.done,     (2, 1, 0))
+    
+    if config['alg'].get('SKIP_REPLAY_BUFFER', False):
+        batch = (obs_block, next_block, act_block, rew_block, don_block)
+    else:
+        disk_replay_buffer.push_block(obs_block, next_block, act_block, rew_block, don_block)
+        if len(disk_replay_buffer) < config["alg"].get("MIN_DISK_SIZE", 1):
+            print("Not enough transitions on disk yet. Skipping update.")
+            return agent_train_states, rng
+        B = config["alg"].get("MINIBATCH_SIZE", 128)
+        batch = disk_replay_buffer.sample_block(B)
 
-    # Push the new block of transitions into the disk-backed replay buffer.
-    disk_replay_buffer.push_block(obs_block, next_block, act_block, rew_block, don_block)
-
-    if len(disk_replay_buffer) < config["alg"].get("MIN_DISK_SIZE", 1):
-        print("Not enough transitions on disk yet. Skipping update.")
-        return agent_train_states, rng
-
-    B = config["alg"].get("MINIBATCH_SIZE", 128)
-    obs_b, nxt_b, act_b, rew_b, don_b = disk_replay_buffer.sample_block(B)
-
-    # Update network using TD(λ) targets (passing lam to train_step).
     new_train_states, loss_vals = train_step(
         agent_train_states,
-        (obs_b, nxt_b, act_b, rew_b, don_b),
+        batch,
         gamma,
         lam
     )
-
     for i in range(N):
-        wandb.log({f"agent_{i}/loss": float(loss_vals[i])}, step=int(new_train_states.n_updates[i]))
+        agent_metrics = {
+            "env_step": float(new_train_states.timesteps[i]),
+            "update_steps": float(new_train_states.n_updates[i]),
+            "env_frame": float(new_train_states.timesteps[i] * env.single_observation_space.shape[0]),
+            "grad_steps": float(new_train_states.grad_steps[i]),
+            "td_loss": float(loss_vals[i]),
+            # If you have qvals computed per agent (for example, during the update), include them.
+            # If not, you can remove or comment out the next line.
+            "qvals": float(qvals[i]),
+        }
+        wandb.log({f"agent_{i}/metrics": agent_metrics},
+                step=int(new_train_states.n_updates[i]))
+
+    # --- Evaluation Rollout ---
+    eval_every = config['alg'].get("EVAL_EVERY", 1000)
+    eval_steps = config['alg'].get("EVAL_STEPS", S)  # evaluation rollout length (can differ from training S)
+    
+    if eval_env is not None and (current_iter % eval_every == 0):
+        eval_obs, eval_env_state = eval_env.reset()
+        eval_envs = config['alg'].get("TEST_ENVS", 0)
+        batched_eval_obs = eval_obs.reshape(N, eval_envs, *eval_obs.shape[1:])
+        batched_eval_env_state = jax.tree_map(
+            lambda x: x.reshape(N, eval_envs, *x.shape[1:]),
+            eval_env_state
+        )
+        
+        # Run evaluation rollout with greedy (ε = 0) actions.
+        _, (eval_transitions, eval_infos) = generate_trajectory(
+            network,
+            agent_train_states,
+            eval_steps,
+            eval_env,
+            batched_eval_obs,
+            batched_eval_env_state,
+            rng,
+            constant_zero_eps_scheduler,
+        )
+        # Compute per-agent evaluation metrics (averaging over rollout steps and eval environments)
+        eval_metrics = {k: jnp.mean(v, axis=(0, 2)) for k, v in eval_infos.items()}
+        eval_metrics_np = {k: np.array(val) for k, val in eval_metrics.items()}
+        for i in range(N):
+            agent_eval_metrics = {k: float(eval_metrics_np[k][i]) for k in eval_metrics_np}
+            wandb.log({f"agent_{i}/eval_env_metrics": agent_eval_metrics},
+                      step=int(new_train_states.n_updates[i]))
 
     return new_train_states, rng
 
@@ -774,17 +826,19 @@ def main(config):
     num_agents = config['alg']["NUM_AGENTS"]
     E = config['alg']["NUM_ENVS"]
     S = config['alg']["NUM_STEPS"]
-    B = config["alg"]["MINIBATCH_SIZE"]
+    mini_buffer_size = config["alg"]["MINI_BUFFER_SIZE"]
     total_envs = num_agents * E
+
+    # Split the key into one per agent
     agent_rngs = jax.random.split(rng, num_agents)
 
-    # 1) Create environment
+    # 1) Create training environment
     env = make_env(total_envs, config)
-    init_obs, env_state = env.reset() 
+    init_obs, env_state = env.reset()
     batched_init_obs = init_obs.reshape(num_agents, E, *init_obs.shape[1:])
     batched_env_state = jax.tree_map(lambda x: x.reshape(num_agents, E, *x.shape[1:]), env_state)
 
-    # 2) Create the QNetwork + agent_train_states
+    # 2) Create the QNetwork and agent train states
     network = QNetwork(
         action_dim=env.single_action_space.n,
         norm_type=config['alg']["NORM_TYPE"],
@@ -795,20 +849,26 @@ def main(config):
     # 3) Create the replay buffer
     memmap_dir = get_memmap_dir(config)
     disk_replay_buffer = DiskGPUMixedReplayBuffer(
-        capacity=1_000_000,              
-        mini_buffer_size=B,          
+        capacity=1_000_000,
+        mini_buffer_size=mini_buffer_size,
         n_agents=num_agents,
         traj_len=S,
-        obs_shape=(4, 84, 84),         
-        memmap_dir=memmap_dir,  
+        obs_shape=(4, 84, 84),
+        memmap_dir=memmap_dir,
     )
 
-    # 4) Epsilon schedule
+    # 4) Epsilon schedule for training
     eps_scheduler = optax.linear_schedule(
         init_value=config['alg']["EPS_START"],
         end_value=config['alg']["EPS_FINISH"],
         transition_steps=int(config['alg']["TOTAL_TIMESTEPS_DECAY"] * config['alg']["EPS_DECAY"]),
     )
+
+    # 5) Create a single evaluation environment if configured.
+    eval_env = None
+    if config['alg'].get("TEST_ENVS", 0) > 0:
+        total_eval_envs = num_agents * config['alg']["TEST_ENVS"]
+        eval_env = make_env(total_eval_envs, config)
 
     alg_name = config.get("ALG_NAME", "qnm")
     env_name = config.get("ENV_NAME", "NAN")
@@ -826,19 +886,21 @@ def main(config):
         mode=config["WANDB_MODE"],
     )
 
-    # 5) Short training loop
-    for iteration in range(int(config['alg']["TRAINING_ITERATIONS"])):
-        # call qnm_algorithm once (generates a trajectory, pushes to replay, samples & updates)
-        agent_train_states, rng = qnm_algorithm(
+    num_iters = int(config['alg']["TRAINING_ITERATIONS"])
+    for iteration in range(num_iters):
+        # Pass the current iteration and the vectorized PRNG keys into qnm_algorithm.
+        agent_train_states, agent_rngs = qnm_algorithm(
             config,
             agent_train_states,
             disk_replay_buffer,
             network,
-            agent_rngs,
+            agent_rngs,  # use vectorized keys
             env,
             eps_scheduler,
             batched_init_obs,
-            batched_env_state
+            batched_env_state,
+            eval_env=eval_env,
+            current_iter=iteration,
         )
         print(f"Iteration {iteration} complete. Disk buffer size={len(disk_replay_buffer)}")
 
