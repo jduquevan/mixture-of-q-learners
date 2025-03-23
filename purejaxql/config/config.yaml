@@ -5,8 +5,11 @@ SEED: 0
 # if  hyperparameters tuning
 HYP_TUNE: False
 
+# debugging
+DEBUG: False
+
 # wandb params
-WANDB_MODE: "disabled"  # set to online to activate wandb
+WANDB_MODE: "online"  # set to online to activate wandb
 ENTITY: ""
 PROJECT: ""
 alg:

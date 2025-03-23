@@ -262,6 +262,109 @@ class Transition:
     q_val: chex.Array
 
 
+@struct.dataclass
+class ReplayBufferState:
+    obs: jnp.ndarray           # [capacity, *obs_shape]
+    actions: jnp.ndarray       # [capacity]
+    rewards: jnp.ndarray       # [capacity]
+    dones: jnp.ndarray         # [capacity]
+    next_obs: jnp.ndarray      # [capacity, *obs_shape]
+    idx: jnp.int32
+    size: jnp.int32
+    capacity: jnp.int32
+
+
+def init_replay_buffer(capacity, num_steps, obs_shape, dtype=jnp.uint8):
+    return ReplayBufferState(
+        obs=jnp.zeros((capacity, num_steps) + obs_shape, dtype=dtype),
+        actions=jnp.zeros((capacity, num_steps), dtype=jnp.int32),
+        rewards=jnp.zeros((capacity, num_steps), dtype=jnp.float32),
+        dones=jnp.zeros((capacity, num_steps), dtype=jnp.bool_),
+        next_obs=jnp.zeros((capacity, num_steps) + obs_shape, dtype=dtype),
+        idx=jnp.array(0, dtype=jnp.int32),
+        size=jnp.array(0, dtype=jnp.int32),
+        capacity=jnp.array(capacity, dtype=jnp.int32),
+    )
+
+
+def replay_buffer_push(rb: ReplayBufferState, 
+                       obs: jnp.ndarray, 
+                       actions: jnp.ndarray, 
+                       rewards: jnp.ndarray, 
+                       dones: jnp.ndarray, 
+                       next_obs: jnp.ndarray):
+    """
+    Args:
+      obs: shape (num_steps, num_envs, *obs_shape)
+      actions: shape (num_steps, num_envs)
+      rewards: shape (num_steps, num_envs)
+      dones: shape (num_steps, num_envs)
+      next_obs: shape (num_steps, num_envs, *obs_shape)
+      
+    Transposes the first two dimensions so that each buffer entry has shape:
+      (num_steps, *obs_shape)
+    and the batch dimension becomes the num_envs.
+    """
+    # Transpose from (num_steps, num_envs, ...) to (num_envs, num_steps, ...)
+    obs = jnp.transpose(obs, (1, 0) + tuple(range(2, obs.ndim)))
+    actions = jnp.transpose(actions, (1, 0))
+    rewards = jnp.transpose(rewards, (1, 0))
+    dones = jnp.transpose(dones, (1, 0))
+    next_obs = jnp.transpose(next_obs, (1, 0) + tuple(range(2, next_obs.ndim)))
+    
+    # Now the batch dimension is num_envs.
+    batch_size = obs.shape[0]
+    indices = (rb.idx + jnp.arange(batch_size)) % rb.capacity
+
+    def scatter(arr, update, idxs):
+         return arr.at[idxs].set(update)
+    
+    new_obs      = scatter(rb.obs,      obs,      indices)
+    new_actions  = scatter(rb.actions,  actions,  indices)
+    new_rewards  = scatter(rb.rewards,  rewards,  indices)
+    new_dones    = scatter(rb.dones,    dones,    indices)
+    new_next_obs = scatter(rb.next_obs, next_obs, indices)
+    
+    new_idx = (rb.idx + batch_size) % rb.capacity
+    new_size = jnp.minimum(rb.size + batch_size, rb.capacity)
+    
+    return rb.replace(
+         obs=new_obs,
+         actions=new_actions,
+         rewards=new_rewards,
+         dones=new_dones,
+         next_obs=new_next_obs,
+         idx=new_idx,
+         size=new_size,
+    )
+
+
+def replay_buffer_sample(rb: ReplayBufferState, rng: jax.random.PRNGKey, batch_size: int):
+    """Sample a batch of transitions uniformly from [0, rb.size) and transpose the first two dimensions.
+    
+    Returns arrays with shape:
+      (num_steps, batch_size, *obs_shape) for observations and next_obs, and
+      (num_steps, batch_size) for actions, rewards, and dones.
+    """
+    max_idx = rb.size
+    idxs = jax.random.randint(rng, shape=(batch_size,), minval=0, maxval=max_idx)
+    
+    batch_obs      = rb.obs[idxs]      # shape: (batch_size, num_steps, *obs_shape)
+    batch_actions  = rb.actions[idxs]  # shape: (batch_size, num_steps)
+    batch_rewards  = rb.rewards[idxs]  # shape: (batch_size, num_steps)
+    batch_dones    = rb.dones[idxs]    # shape: (batch_size, num_steps)
+    batch_next_obs = rb.next_obs[idxs] # shape: (batch_size, num_steps, *obs_shape)
+    
+    # Transpose the first two dimensions so that the rollout (time steps) become the first dimension.
+    batch_obs = jnp.transpose(batch_obs, (1, 0) + tuple(range(2, batch_obs.ndim)))
+    batch_actions = jnp.transpose(batch_actions, (1, 0))
+    batch_rewards = jnp.transpose(batch_rewards, (1, 0))
+    batch_dones = jnp.transpose(batch_dones, (1, 0))
+    batch_next_obs = jnp.transpose(batch_next_obs, (1, 0) + tuple(range(2, batch_next_obs.ndim)))
+    
+    return batch_obs, batch_actions, batch_rewards, batch_dones, batch_next_obs
+
+
 class CustomTrainState(TrainState):
     batch_stats: Any
     timesteps: int = 0
@@ -368,9 +471,17 @@ def make_train(config):
         rng, _rng = jax.random.split(rng)
         train_state = create_agent(rng)
 
+        # REPLAY BUFFER
+        replay_buffer_state = init_replay_buffer(
+            capacity=config["REPLAY_BUFFER_SIZE"],
+            num_steps=config["NUM_STEPS"],
+            obs_shape=env.single_observation_space.shape,
+            dtype=jnp.uint8
+        )
+
         # TRAINING LOOP
         def _update_step(runner_state, unused):
-            train_state, expl_state, test_metrics, rng = runner_state
+            train_state, expl_state, test_metrics, rng, replay_buffer_state = runner_state
 
             # SAMPLE PHASE
             def _step_env(carry, _):
@@ -395,7 +506,7 @@ def make_train(config):
                 new_obs, new_env_state, reward, new_done, info = env.step(
                     env_state, new_action
                 )
-
+                
                 transition = Transition(
                     obs=last_obs,
                     action=new_action,
@@ -414,6 +525,47 @@ def make_train(config):
                 None,
                 config["NUM_STEPS"],
             )
+            
+            num_test_envs = config["TEST_ENVS"]
+            train_transitions = jax.tree.map(lambda x, num_test=num_test_envs: x[:, :-num_test], transitions)
+            replay_buffer_state = replay_buffer_push(
+                replay_buffer_state,
+                obs=train_transitions.obs,
+                actions=train_transitions.action,
+                rewards=train_transitions.reward,
+                dones=train_transitions.done,
+                next_obs=train_transitions.next_obs,
+            )
+            
+            rng, sample_rng = jax.random.split(rng)
+            sampled_obs, sampled_actions, sampled_rewards, sampled_dones, sampled_next_obs = replay_buffer_sample(
+                replay_buffer_state, sample_rng, config["BATCH_SIZE"]
+            )
+
+            num_steps, num_train_envs = sampled_obs.shape[:2]
+            flat_obs = sampled_obs.reshape(-1, *sampled_obs.shape[2:])
+            flat_q_vals = network.apply(
+                {"params": train_state.params, "batch_stats": train_state.batch_stats},
+                flat_obs,
+                train=False
+            )  # shape: (num_steps*num_train_envs, num_actions)
+
+            sampled_q_vals = flat_q_vals.reshape(num_steps, num_train_envs, -1)
+
+            train_sampled = Transition(
+                obs=sampled_obs,       # shape: (num_steps, num_train_envs, 4,84,84)
+                action=sampled_actions, # shape: (num_steps, num_train_envs)
+                reward=sampled_rewards, # shape: (num_steps, num_train_envs)
+                done=sampled_dones,     # shape: (num_steps, num_train_envs)
+                next_obs=sampled_next_obs,  # shape: (num_steps, num_train_envs, 4,84,84)
+                q_val=sampled_q_vals    # shape: (num_steps, num_train_envs) if computed
+            )
+            transitions = jax.tree_map(
+                lambda orig, new: orig.at[:, : -config["TEST_ENVS"]].set(new),
+                transitions,
+                train_sampled
+            )
+
             expl_state = tuple(expl_state)
 
             if config.get("TEST_DURING_TRAINING", False):
@@ -569,7 +721,7 @@ def make_train(config):
 
                 jax.debug.callback(callback, metrics, original_seed)
 
-            runner_state = (train_state, tuple(expl_state), test_metrics, rng)
+            runner_state = (train_state, tuple(expl_state), test_metrics, rng, replay_buffer_state )
 
             return runner_state, metrics
 
@@ -579,7 +731,7 @@ def make_train(config):
         # train
         rng, _rng = jax.random.split(rng)
         expl_state = (init_obs, env_state)
-        runner_state = (train_state, expl_state, test_metrics, _rng)
+        runner_state = (train_state, expl_state, test_metrics, _rng, replay_buffer_state )
 
         runner_state, metrics = jax.lax.scan(
             _update_step, runner_state, None, config["NUM_UPDATES"]
@@ -690,6 +842,8 @@ def tune(default_config):
 def main(config):
     config = OmegaConf.to_container(config)
     print("Config:\n", OmegaConf.to_yaml(config))
+    if config["DEBUG"]:
+        jax.config.update("jax_disable_jit", True)
     if config["HYP_TUNE"]:
         tune(config)
     else:
