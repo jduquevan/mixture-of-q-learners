@@ -703,46 +703,57 @@ def qnm_algorithm(
     eps_scheduler,
     batched_init_obs,
     batched_env_state,
-    eval_env=None,          
-    current_iter=0,   
+    eval_env=None,
+    current_iter=0,
+    eval_batched_obs=None,
+    eval_batched_env_state=None
 ):
     """
     Runs one iteration of the QNM algorithm:
       - Generates a training trajectory using the current (exploratory) policy.
-      - Computes per-agent training metrics and uses transitions to update the network.
+      - Uses transitions to update the network.
       - If an evaluation environment is provided and current_iter is a multiple of EVAL_EVERY,
-        performs a rollout on the evaluation environment using greedy (ε=0) actions,
-        and logs per-agent evaluation metrics.
-    
-    TD(λ) targets are computed using the lambda parameter ("LAMBDA" in config).
+        performs a rollout using greedy (ε=0) actions, logs evaluation metrics, and returns the
+        updated evaluation environment state to continue from next iteration.
     """
+
+    # Hyperparameters
     N = config['alg']['NUM_AGENTS']
     S = config['alg']['NUM_STEPS']
     gamma = config['alg'].get('GAMMA', 0.99)
     lam = config['alg'].get('LAMBDA', 0.9)
 
     # --- Training Rollout ---
-    (next_obs, next_env_state, _), (transitions, infos) = generate_trajectory(
+    (next_obs, next_env_state, new_rng), (transitions, infos) = generate_trajectory(
         network,
         agent_train_states,
-        config['alg']['NUM_STEPS'],
+        S,
         env,
         batched_init_obs,
         batched_env_state,
         rng,
         eps_scheduler,
     )
-    
+
+    # Average Q-values at chosen actions (just for logging)
     qvals = jnp.mean(
-        jnp.take_along_axis(transitions.q_val, transitions.action[..., None], axis=-1).squeeze(-1),
+        jnp.take_along_axis(
+            transitions.q_val,
+            transitions.action[..., None],
+            axis=-1
+        ).squeeze(-1),
         axis=(0, 2)
     )
+
+    # Compute environment metrics and log them
     metrics = {k: jnp.mean(v, axis=(0, 2)) for k, v in infos.items()}
     metrics_np = {k: np.array(val) for k, val in metrics.items()}
-    for i in range(config['alg']['NUM_AGENTS']):
+    for i in range(N):
         agent_metrics = {k: float(metrics_np[k][i]) for k in metrics_np}
-        wandb.log({f"agent_{i}/env_metrics": agent_metrics},
-                  step=int(agent_train_states.n_updates[i]))
+        wandb.log(
+            {f"agent_{i}/env_metrics": agent_metrics},
+            step=int(agent_train_states.n_updates[i])
+        )
 
     # Rearrange transitions into blocks of shape (B, N, S, ...)
     obs_block  = jnp.transpose(transitions.obs,      (2, 1, 0) + tuple(range(3, transitions.obs.ndim)))
@@ -750,23 +761,23 @@ def qnm_algorithm(
     act_block  = jnp.transpose(transitions.action,   (2, 1, 0))
     rew_block  = jnp.transpose(transitions.reward,   (2, 1, 0))
     don_block  = jnp.transpose(transitions.done,     (2, 1, 0))
-    
+
+    # Either sample directly (SKIP_REPLAY_BUFFER) or store to disk + sample from there
     if config['alg'].get('SKIP_REPLAY_BUFFER', False):
         batch = (obs_block, next_block, act_block, rew_block, don_block)
     else:
         disk_replay_buffer.push_block(obs_block, next_block, act_block, rew_block, don_block)
         if len(disk_replay_buffer) < config["alg"].get("MIN_DISK_SIZE", 1):
             print("Not enough transitions on disk yet. Skipping update.")
-            return agent_train_states, rng
+            return agent_train_states, new_rng, None, None
+        # Sample from the replay buffer
         B = config["alg"].get("MINIBATCH_SIZE", 128)
         batch = disk_replay_buffer.sample_block(B)
 
-    new_train_states, loss_vals = train_step(
-        agent_train_states,
-        batch,
-        gamma,
-        lam
-    )
+    # Perform a training step
+    new_train_states, loss_vals = train_step(agent_train_states, batch, gamma, lam)
+
+    # Log training metrics
     for i in range(N):
         agent_metrics = {
             "env_step": float(new_train_states.timesteps[i]),
@@ -774,46 +785,48 @@ def qnm_algorithm(
             "env_frame": float(new_train_states.timesteps[i] * env.single_observation_space.shape[0]),
             "grad_steps": float(new_train_states.grad_steps[i]),
             "td_loss": float(loss_vals[i]),
-            # If you have qvals computed per agent (for example, during the update), include them.
-            # If not, you can remove or comment out the next line.
             "qvals": float(qvals[i]),
         }
-        wandb.log({f"agent_{i}/metrics": agent_metrics},
-                step=int(new_train_states.n_updates[i]))
+        wandb.log(
+            {f"agent_{i}/metrics": agent_metrics},
+            step=int(new_train_states.n_updates[i])
+        )
 
     # --- Evaluation Rollout ---
     eval_every = config['alg'].get("EVAL_EVERY", 1000)
-    eval_steps = config['alg'].get("EVAL_STEPS", S)  # evaluation rollout length (can differ from training S)
-    
-    if eval_env is not None and (current_iter % eval_every == 0):
-        eval_obs, eval_env_state = eval_env.reset()
-        eval_envs = config['alg'].get("TEST_ENVS", 0)
-        batched_eval_obs = eval_obs.reshape(N, eval_envs, *eval_obs.shape[1:])
-        batched_eval_env_state = jax.tree_map(
-            lambda x: x.reshape(N, eval_envs, *x.shape[1:]),
-            eval_env_state
-        )
-        
-        # Run evaluation rollout with greedy (ε = 0) actions.
-        _, (eval_transitions, eval_infos) = generate_trajectory(
+    eval_steps = config['alg'].get("EVAL_STEPS", S)
+
+    # If we have an eval_env and it's time to evaluate, do a greedy rollout
+    new_eval_obs, new_eval_env_state = eval_batched_obs, eval_batched_env_state
+    if eval_env is not None and (current_iter % eval_every == 0) and (eval_batched_obs is not None) and (eval_batched_env_state is not None):
+        (final_obs, final_env_state, final_rng), (eval_transitions, eval_infos) = generate_trajectory(
             network,
-            agent_train_states,
+            new_train_states,
             eval_steps,
             eval_env,
-            batched_eval_obs,
-            batched_eval_env_state,
-            rng,
+            eval_batched_obs,
+            eval_batched_env_state,
+            new_rng,
             constant_zero_eps_scheduler,
         )
-        # Compute per-agent evaluation metrics (averaging over rollout steps and eval environments)
+        # Update the eval RNG in case you want to keep it around, or you could just discard it
+        new_rng = final_rng
+        new_eval_obs = final_obs
+        new_eval_env_state = final_env_state
+
+        # Compute and log eval metrics
         eval_metrics = {k: jnp.mean(v, axis=(0, 2)) for k, v in eval_infos.items()}
         eval_metrics_np = {k: np.array(val) for k, val in eval_metrics.items()}
         for i in range(N):
             agent_eval_metrics = {k: float(eval_metrics_np[k][i]) for k in eval_metrics_np}
-            wandb.log({f"agent_{i}/eval_env_metrics": agent_eval_metrics},
-                      step=int(new_train_states.n_updates[i]))
+            wandb.log(
+                {f"agent_{i}/eval_env_metrics": agent_eval_metrics},
+                step=int(new_train_states.n_updates[i])
+            )
 
-    return new_train_states, rng
+    # Return the updated train states, RNG, and possibly updated evaluation env state
+    return new_train_states, new_rng, new_eval_obs, new_eval_env_state
+
 
 @hydra.main(version_base=None, config_path="./config", config_name="config")
 def main(config):
@@ -869,6 +882,9 @@ def main(config):
     if config['alg'].get("TEST_ENVS", 0) > 0:
         total_eval_envs = num_agents * config['alg']["TEST_ENVS"]
         eval_env = make_env(total_eval_envs, config)
+        eval_obs, eval_env_state = eval_env.reset()
+        batched_eval_obs = eval_obs.reshape(num_agents, config['alg']["TEST_ENVS"], *eval_obs.shape[1:])
+        batched_eval_env_state = jax.tree_map(lambda x: x.reshape(num_agents, config['alg']["TEST_ENVS"], *x.shape[1:]), eval_env_state)
 
     alg_name = config.get("ALG_NAME", "qnm")
     env_name = config.get("ENV_NAME", "NAN")
@@ -901,6 +917,8 @@ def main(config):
             batched_env_state,
             eval_env=eval_env,
             current_iter=iteration,
+            eval_batched_obs=batched_eval_obs,
+            eval_batched_env_state=batched_env_state
         )
         print(f"Iteration {iteration} complete. Disk buffer size={len(disk_replay_buffer)}")
 
