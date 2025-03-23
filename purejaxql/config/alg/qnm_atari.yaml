@@ -1,4 +1,4 @@
-ALG_NAME: "pqn"
+ALG_NAME: "qnm"
 TOTAL_TIMESTEPS: 5e7 # with 4 frame skip correpsnds to 200M frames
 TOTAL_TIMESTEPS_DECAY: 5e7 # will be used for decay functions (epsilon and lr)
 NUM_ENVS: 128 # parallel environments PER agent
@@ -16,7 +16,7 @@ GAMMA: 0.99
 LAMBDA: 0.65
 BATCH_SIZE: 128
 LAMBDA_N: 5
-NUM_AGENTS: 8
+NUM_AGENTS: 1
 MEMMAP_DIR: "/home/mila/j/juan.duque/scratch/purejaxql/rb"
 TRAINING_ITERATIONS: 1e9
 MINIBATCH_SIZE: 32

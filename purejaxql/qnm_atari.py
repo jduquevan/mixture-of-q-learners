@@ -617,43 +617,45 @@ def train_step(agent_train_states, batch, gamma, lam):
     """
     obs_b, nxt_b, act_b, rew_b, don_b = batch
 
-    def compute_td_lambda_returns(rew, done, q_next, gamma_, lam):
-        # rew, done, and q_next are assumed to be 1D arrays over T timesteps.
-        T = rew.shape[0]
-        # Bootstrapped return for the final timestep.
-        G_last = rew[T - 1] + gamma_ * (1 - done[T - 1]) * q_next[T - 1]
-        def body_fn(G_next, idx):
-            G = rew[idx] + gamma_ * (1 - done[idx]) * ((1 - lam) * q_next[idx] + lam * G_next)
-            return G, G
-        indices = jnp.arange(T - 1)
-        indices_rev = jnp.flip(indices, axis=0)
-        _, G_values = jax.lax.scan(body_fn, G_last, indices_rev)
-        G_values = jnp.flip(G_values, axis=0)
-        G_all = jnp.concatenate([G_values, jnp.array([G_last])], axis=0)
-        return G_all
+    def compute_targets_stable(reward, done, q_next, gamma, lam):
+        lambda_returns = reward[-1] + gamma * (1 - done[-1]) * jnp.max(q_next[-1])
+        last_q = jnp.max(q_next[-1])
+        def _get_target(carry, x):
+            rew, q, d = x
+            target_bootstrap = rew + gamma * (1 - d) * carry[1]
+            delta = carry[0] - carry[1]
+            lambda_ret = target_bootstrap + gamma * lam * delta
+            lambda_ret = (1 - d) * lambda_ret + d * rew
+            next_q = jnp.max(q)
+            return (lambda_ret, next_q), lambda_ret
+        xs = (reward[:-1], q_next[:-1], done[:-1])
+        (_, _), targets = jax.lax.scan(_get_target, (lambda_returns, last_q), xs, reverse=True)
+        targets = jnp.concatenate([targets, jnp.array([lambda_returns])])
+        return targets
 
     def per_agent_multistep_loss(params, bstat, obs, nxt, act, rew, done):
-        # obs, nxt: shape (B, S, *obs_shape)
-        # act, rew, done: shape (B, S)
         B_, S_ = obs.shape[:2]
-        obs_2d = obs.reshape((B_ * S_,) + obs.shape[2:])
-        nxt_2d = nxt.reshape((B_ * S_,) + nxt.shape[2:])
-        act_2d = act.reshape((B_ * S_,))
-        rew_2d = rew.reshape((B_ * S_,))
-        don_2d = done.reshape((B_ * S_,))
-        
+        obs_r = obs.reshape(B_, S_, *obs.shape[2:])
+        nxt_r = nxt.reshape(B_, S_, *nxt.shape[2:])
+        act_r = act.reshape(B_, S_)
+        rew_r = rew.reshape(B_, S_)
+        done_r = done.reshape(B_, S_)
         qvals, vars_out = agent_train_states.apply_fn(
             {"params": params, "batch_stats": bstat},
-            obs_2d, train=True, mutable=["batch_stats"]
+            obs_r.reshape(B_ * S_, *obs_r.shape[2:]),
+            train=True, mutable=["batch_stats"]
         )
+        qvals = qvals.reshape(B_, S_, -1)
         next_qvals = agent_train_states.apply_fn(
             {"params": params, "batch_stats": bstat},
-            nxt_2d, train=False
+            nxt_r.reshape(B_ * S_, *nxt_r.shape[2:]),
+            train=False
         )
-        max_next_q = jnp.max(next_qvals, axis=-1)
-        # Compute TD(λ) returns for every transition (flattened over time).
-        g_all = compute_td_lambda_returns(rew_2d, don_2d, max_next_q, gamma, lam)
-        chosen_q = jnp.take_along_axis(qvals, act_2d[..., None], axis=-1).squeeze(-1)
+        next_qvals = next_qvals.reshape(B_, S_, -1)
+        g_all = jax.vmap(lambda r, d, q: compute_targets_stable(r, d, q, gamma, lam))(
+            rew_r, done_r, next_qvals
+        )
+        chosen_q = jnp.take_along_axis(qvals, act_r[..., None], axis=-1).squeeze(-1)
         loss = 0.5 * jnp.mean((chosen_q - g_all) ** 2)
         return loss, vars_out["batch_stats"]
 
@@ -825,7 +827,7 @@ def qnm_algorithm(
             )
 
     # Return the updated train states, RNG, and possibly updated evaluation env state
-    return new_train_states, new_rng, new_eval_obs, new_eval_env_state
+    return new_train_states, new_rng
 
 
 @hydra.main(version_base=None, config_path="./config", config_name="config")
@@ -918,7 +920,7 @@ def main(config):
             eval_env=eval_env,
             current_iter=iteration,
             eval_batched_obs=batched_eval_obs,
-            eval_batched_env_state=batched_env_state
+            eval_batched_env_state=batched_eval_env_state
         )
         print(f"Iteration {iteration} complete. Disk buffer size={len(disk_replay_buffer)}")
 
