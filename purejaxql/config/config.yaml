@@ -1,3 +1,6 @@
+defaults:
+  - _self_
+  - cluster@_global_: juan_mila.yaml
 # experiment params
 NUM_SEEDS: 1
 SEED: 0
@@ -10,8 +13,8 @@ DEBUG: False
 
 # wandb params
 WANDB_MODE: "online"  # set to online to activate wandb
-ENTITY: ""
-PROJECT: ""
+ENTITY: "puredip"
+PROJECT: "Mixture-of-Q-learners"
 alg:
   WANDB_LOG_ALL_SEEDS: False # will log all the vmapped seeds separetely
 
