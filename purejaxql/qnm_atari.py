@@ -781,6 +781,7 @@ def qnm_algorithm(
 
     # Log training metrics
     for i in range(N):
+        eps_val = float(eps_scheduler(new_train_states.n_updates[i]))
         agent_metrics = {
             "env_step": float(new_train_states.timesteps[i]),
             "update_steps": float(new_train_states.n_updates[i]),
@@ -788,6 +789,7 @@ def qnm_algorithm(
             "grad_steps": float(new_train_states.grad_steps[i]),
             "td_loss": float(loss_vals[i]),
             "qvals": float(qvals[i]),
+            "epsilon": eps_val, 
         }
         wandb.log(
             {f"agent_{i}/metrics": agent_metrics},
@@ -827,12 +829,15 @@ def qnm_algorithm(
             )
 
     # Return the updated train states, RNG, and possibly updated evaluation env state
-    return new_train_states, new_rng
+    return new_train_states, new_rng, next_env_state, next_obs, new_eval_env_state, new_eval_obs
 
 
 @hydra.main(version_base=None, config_path="./config", config_name="config")
 def main(config):
     config = OmegaConf.to_container(config)
+    config["NUM_UPDATES_DECAY"] = (
+        config['alg']["TOTAL_TIMESTEPS_DECAY"] // config['alg']["NUM_STEPS"] // config['alg']["NUM_ENVS"]
+    )
     print("Config:\n", OmegaConf.to_yaml(config))
     if config["DEBUG"]:
         jax.config.update("jax_disable_jit", True)
@@ -876,7 +881,7 @@ def main(config):
     eps_scheduler = optax.linear_schedule(
         init_value=config['alg']["EPS_START"],
         end_value=config['alg']["EPS_FINISH"],
-        transition_steps=int(config['alg']["TOTAL_TIMESTEPS_DECAY"] * config['alg']["EPS_DECAY"]),
+        transition_steps=int(config["NUM_UPDATES_DECAY"] * config['alg']["EPS_DECAY"]),
     )
 
     # 5) Create a single evaluation environment if configured.
@@ -903,11 +908,13 @@ def main(config):
         config=config,
         mode=config["WANDB_MODE"],
     )
+    obs = batched_init_obs
+    env_state = batched_env_state
 
     num_iters = int(config['alg']["TRAINING_ITERATIONS"])
     for iteration in range(num_iters):
         # Pass the current iteration and the vectorized PRNG keys into qnm_algorithm.
-        agent_train_states, agent_rngs = qnm_algorithm(
+        agent_train_states, agent_rngs, env_state, obs, batched_eval_env_state, batched_eval_obs = qnm_algorithm(
             config,
             agent_train_states,
             disk_replay_buffer,
@@ -915,8 +922,8 @@ def main(config):
             agent_rngs,  # use vectorized keys
             env,
             eps_scheduler,
-            batched_init_obs,
-            batched_env_state,
+            obs,
+            env_state,
             eval_env=eval_env,
             current_iter=iteration,
             eval_batched_obs=batched_eval_obs,
