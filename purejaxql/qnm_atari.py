@@ -139,31 +139,20 @@ class JaxLogEnvPoolWrapper(gym.Wrapper):
 
     def reset(self, **kwargs):
         observations = super(JaxLogEnvPoolWrapper, self).reset(**kwargs)
-        # Update num_envs based on the returned observations.
-        self.num_envs = observations.shape[0]
-        init_handle_arr = jnp.array(self.init_handle)
-        if init_handle_arr.shape[0] != self.num_envs:
-            factor = self.num_envs // init_handle_arr.shape[0]
-            tiled_handle = jnp.tile(init_handle_arr, (factor,))
-        else:
-            tiled_handle = init_handle_arr
+        
         env_state = LogEnvState(
-            handle=tiled_handle,
-            lives=jnp.zeros(self.num_envs, dtype=jnp.float32),
-            episode_returns=jnp.zeros(self.num_envs, dtype=jnp.float32),
-            episode_lengths=jnp.zeros(self.num_envs, dtype=jnp.float32),
-            returned_episode_returns=jnp.zeros(self.num_envs, dtype=jnp.float32),
-            returned_episode_lengths=jnp.zeros(self.num_envs, dtype=jnp.float32),
+            jnp.array(self.init_handle),
+            jnp.zeros(self.num_envs, dtype=jnp.float32),
+            jnp.zeros(self.num_envs, dtype=jnp.float32),
+            jnp.zeros(self.num_envs, dtype=jnp.float32),
+            jnp.zeros(self.num_envs, dtype=jnp.float32),
+            jnp.zeros(self.num_envs, dtype=jnp.float32),
         )
         return observations, env_state
 
     @partial(jax.jit, static_argnums=(0,))
     def step(self, state, action):
         new_handle, (observations, rewards, dones, infos) = self.step_f(state.handle, action)
-        # Ensure new_handle has one entry per environment.
-        if new_handle.shape[0] != self.num_envs:
-            factor = self.num_envs // new_handle.shape[0]
-            new_handle = jnp.tile(new_handle, (factor,))
         new_episode_return = state.episode_returns + infos["reward"]
         new_episode_length = state.episode_lengths + 1
         state = state.replace(
@@ -179,9 +168,6 @@ class JaxLogEnvPoolWrapper(gym.Wrapper):
             elapsed_steps = infos["elapsed_step"]
             terminated = infos["terminated"] + infos["TimeLimit.truncated"]
             infos = {}
-        else:
-            elapsed_steps = infos.get("elapsed_step", 0)
-            terminated = infos.get("terminated", 0) + infos.get("TimeLimit.truncated", 0)
         normalize_score = lambda x: (x - self.env_random_score) / (self.env_human_score - self.env_random_score)
         infos["returned_episode_returns"] = state.returned_episode_returns
         infos["normalized_returned_episode_returns"] = normalize_score(state.returned_episode_returns)
@@ -505,15 +491,14 @@ def generate_trajectory(network, train_states, num_steps, env, init_obs, env_sta
 
         def merge_axes(x):
             return x.reshape(N * E, *x.shape[2:])
-        merged_env_state = jax.tree_map(merge_axes, env_state)
         merged_action = new_action.reshape(-1)
 
-        merged_obs, merged_env_state_out, merged_reward, merged_done, merged_info = env.step(merged_env_state, merged_action)
+        merged_obs, merged_env_state_out, merged_reward, merged_done, merged_info = env.step(env_state, merged_action)
 
         def split_axes(x):
             return x.reshape(N, E, *x.shape[1:])
         new_obs = jax.tree_map(split_axes, merged_obs)
-        new_env_state = jax.tree_map(split_axes, merged_env_state_out)
+        new_env_state = merged_env_state_out
         reward = split_axes(merged_reward)
         done = split_axes(merged_done)
         info = jax.tree_map(split_axes, merged_info)
@@ -856,7 +841,6 @@ def main(config):
     env = make_env(total_envs, config)
     init_obs, env_state = env.reset()
     batched_init_obs = init_obs.reshape(num_agents, E, *init_obs.shape[1:])
-    batched_env_state = jax.tree_map(lambda x: x.reshape(num_agents, E, *x.shape[1:]), env_state)
 
     # 2) Create the QNetwork and agent train states
     network = QNetwork(
@@ -891,7 +875,6 @@ def main(config):
         eval_env = make_env(total_eval_envs, config)
         eval_obs, eval_env_state = eval_env.reset()
         batched_eval_obs = eval_obs.reshape(num_agents, config['alg']["TEST_ENVS"], *eval_obs.shape[1:])
-        batched_eval_env_state = jax.tree_map(lambda x: x.reshape(num_agents, config['alg']["TEST_ENVS"], *x.shape[1:]), eval_env_state)
 
     alg_name = config.get("ALG_NAME", "qnm")
     env_name = config.get("ENV_NAME", "NAN")
@@ -909,12 +892,11 @@ def main(config):
         mode=config["WANDB_MODE"],
     )
     obs = batched_init_obs
-    env_state = batched_env_state
 
     num_iters = int(config['alg']["TRAINING_ITERATIONS"])
     for iteration in range(num_iters):
         # Pass the current iteration and the vectorized PRNG keys into qnm_algorithm.
-        agent_train_states, agent_rngs, env_state, obs, batched_eval_env_state, batched_eval_obs = qnm_algorithm(
+        agent_train_states, agent_rngs, env_state, obs, eval_env_state, batched_eval_obs = qnm_algorithm(
             config,
             agent_train_states,
             disk_replay_buffer,
@@ -927,7 +909,7 @@ def main(config):
             eval_env=eval_env,
             current_iter=iteration,
             eval_batched_obs=batched_eval_obs,
-            eval_batched_env_state=batched_eval_env_state
+            eval_batched_env_state=eval_env_state
         )
         print(f"Iteration {iteration} complete. Disk buffer size={len(disk_replay_buffer)}")
 
