@@ -2,7 +2,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from functools import partial
-from typing import Any
+from typing import Any, Tuple
 
 from flax import struct
 from flax.training.train_state import TrainState
@@ -152,46 +152,82 @@ class JaxLogEnvPoolWrapper(gym.Wrapper):
 
     @partial(jax.jit, static_argnums=(0,))
     def step(self, state, action):
-        new_handle, (observations, rewards, dones, infos) = self.step_f(state.handle, action)
+        new_handle, (observations, rewards, dones, infos) = self.step_f(
+            state.handle, action
+        )
+
         new_episode_return = state.episode_returns + infos["reward"]
         new_episode_length = state.episode_lengths + 1
         state = state.replace(
             handle=new_handle,
-            episode_returns=(new_episode_return) * (1 - infos["terminated"]) * (1 - infos["TimeLimit.truncated"]),
-            episode_lengths=(new_episode_length) * (1 - infos["terminated"]) * (1 - infos["TimeLimit.truncated"]),
-            returned_episode_returns=jnp.where(infos["terminated"] + infos["TimeLimit.truncated"],
-                                            new_episode_return, state.returned_episode_returns),
-            returned_episode_lengths=jnp.where(infos["terminated"] + infos["TimeLimit.truncated"],
-                                            new_episode_length, state.returned_episode_lengths),
+            episode_returns=(new_episode_return)
+            * (1 - infos["terminated"])
+            * (1 - infos["TimeLimit.truncated"]),
+            episode_lengths=(new_episode_length)
+            * (1 - infos["terminated"])
+            * (1 - infos["TimeLimit.truncated"]),
+            returned_episode_returns=jnp.where(
+                infos["terminated"] + infos["TimeLimit.truncated"],
+                new_episode_return,
+                state.returned_episode_returns,
+            ),
+            returned_episode_lengths=jnp.where(
+                infos["terminated"] + infos["TimeLimit.truncated"],
+                new_episode_length,
+                state.returned_episode_lengths,
+            ),
         )
+
         if self.reset_info:
             elapsed_steps = infos["elapsed_step"]
             terminated = infos["terminated"] + infos["TimeLimit.truncated"]
             infos = {}
-        normalize_score = lambda x: (x - self.env_random_score) / (self.env_human_score - self.env_random_score)
+        normalize_score = lambda x: (x - self.env_random_score) / (
+            self.env_human_score - self.env_random_score
+        )
         infos["returned_episode_returns"] = state.returned_episode_returns
-        infos["normalized_returned_episode_returns"] = normalize_score(state.returned_episode_returns)
+        infos["normalized_returned_episode_returns"] = normalize_score(
+            state.returned_episode_returns
+        )
         infos["returned_episode_lengths"] = state.returned_episode_lengths
         infos["elapsed_step"] = elapsed_steps
         infos["returned_episode"] = terminated
-        return observations, state, rewards, dones, infos
+
+        return (
+            observations,
+            state,
+            rewards,
+            dones,
+            infos,
+        )
 
 class CNN(nn.Module):
-    norm_type: str
+    norm_type: str = "layer_norm"
 
     @nn.compact
     def __call__(self, x, train: bool):
+        if self.norm_type == "layer_norm":
+            normalize = lambda x: nn.LayerNorm()(x)
+        elif self.norm_type == "batch_norm":
+            normalize = lambda x: nn.BatchNorm(use_running_average=not train)(x)
+        else: 
+            normalize = lambda x: x
+
         x = nn.Conv(features=32, kernel_size=(8, 8), strides=(4, 4),
                     padding="VALID", kernel_init=nn.initializers.kaiming_normal())(x)
+        x = normalize(x) 
         x = nn.relu(x)
         x = nn.Conv(features=64, kernel_size=(4, 4), strides=(2, 2),
                     padding="VALID", kernel_init=nn.initializers.kaiming_normal())(x)
+        x = normalize(x) 
         x = nn.relu(x)
         x = nn.Conv(features=64, kernel_size=(3, 3), strides=(1, 1),
                     padding="VALID", kernel_init=nn.initializers.kaiming_normal())(x)
+        x = normalize(x) 
         x = nn.relu(x)
         x = x.reshape((x.shape[0], -1))
         x = nn.Dense(features=512, kernel_init=nn.initializers.kaiming_normal())(x)
+        x = normalize(x) 
         x = nn.relu(x)
         return x
 
@@ -457,28 +493,29 @@ class DiskGPUMixedReplayBuffer:
 def constant_zero_eps_scheduler(_):
     return 0.0
 
-@partial(jax.jit, static_argnums=(0, 2, 3, 7))
-def generate_trajectory(network, train_states, num_steps, env, init_obs, env_state, rng, eps_scheduler):
-    def step_env(carry, _, agent_train_states, network, env, eps_scheduler):
+@partial(jax.jit, static_argnums=(0, 2, 3, 7, 8)) 
+def generate_trajectory(network, train_states, num_steps, env, init_obs, env_state, rng, eps_scheduler, num_eval_envs=0):  
+    def step_env(carry, _, agent_train_states, network, env, eps_scheduler, num_eval_envs):  #
         # carry: (last_obs, env_state, rng)
-        # last_obs: (N, E, obs_shape)
-        # env_state: each field (N, E, ...)
-        # rng: (N, key_size)
         last_obs, env_state, rng = carry
-        N, E = last_obs.shape[:2]
-        rng_split = jax.vmap(lambda key: jax.random.split(key, 3))(rng)  # (N, 3, key_size)
+        N, E_total = last_obs.shape[:2]  
+        rng_split = jax.vmap(lambda key: jax.random.split(key, 3))(rng)
         new_rng = rng_split[:, 0, :]
         rng_a   = rng_split[:, 1, :]
         _rng_extra = rng_split[:, 2, :]
 
         def agent_apply(ts, obs):
             return network.apply({"params": ts.params, "batch_stats": ts.batch_stats}, obs, train=False)
-        q_vals = jax.vmap(agent_apply)(agent_train_states, last_obs)  # (N, E, action_dim)
+        q_vals = jax.vmap(agent_apply)(agent_train_states, last_obs)  # (N, E_total, action_dim)
 
+        # Use the eps_scheduler value for training environments and force 0 for evaluation envs:
         eps_value = eps_scheduler(agent_train_states.n_updates[0])
-        eps = jnp.full((N, E), eps_value)
+        train_count = E_total - num_eval_envs  
+        eps_train = jnp.full((N, train_count), eps_value) 
+        eps_test = jnp.zeros((N, num_eval_envs))          
+        eps = jnp.concatenate([eps_train, eps_test], axis=1)  
 
-        rngs = jax.vmap(lambda key: jax.random.split(key, E))(rng_a)  # (N, E, key_size)
+        rngs = jax.vmap(lambda key: jax.random.split(key, E_total))(rng_a)  
         def eps_greedy_exploration(rn, q_vals_, eps_):
             a_greedy = jnp.argmax(q_vals_, -1)
             explore = jax.random.uniform(rn) < eps_
@@ -487,16 +524,14 @@ def generate_trajectory(network, train_states, num_steps, env, init_obs, env_sta
 
         def compute_actions(q, keys, eps_row):
             return jax.vmap(eps_greedy_exploration)(keys, q, eps_row)
-        new_action = jax.vmap(compute_actions)(q_vals, rngs, eps)  # (N, E)
-
-        def merge_axes(x):
-            return x.reshape(N * E, *x.shape[2:])
+            
+        new_action = jax.vmap(compute_actions)(q_vals, rngs, eps) 
         merged_action = new_action.reshape(-1)
-
         merged_obs, merged_env_state_out, merged_reward, merged_done, merged_info = env.step(env_state, merged_action)
 
         def split_axes(x):
-            return x.reshape(N, E, *x.shape[1:])
+            return x.reshape(N, E_total, *x.shape[1:])
+
         new_obs = jax.tree_map(split_axes, merged_obs)
         new_env_state = merged_env_state_out
         reward = split_axes(merged_reward)
@@ -513,15 +548,15 @@ def generate_trajectory(network, train_states, num_steps, env, init_obs, env_sta
         )
         return (new_obs, new_env_state, new_rng), (transition, info)
 
-    # init_obs: (N, E, obs_shape), env_state: (N, E, ...), rng: (N, key_size)
     init_carry = (init_obs, env_state, rng)
     final_carry, (transitions, infos) = jax.lax.scan(
-        lambda carry, _: step_env(carry, None, train_states, network, env, eps_scheduler),
+        lambda carry, _: step_env(carry, None, train_states, network, env, eps_scheduler, num_eval_envs),  # CHANGED: pass num_eval_envs
         init_carry,
         None,
         length=num_steps,
     )
     return final_carry, (transitions, infos)
+
 
 def make_env(num_envs, config):
     env = envpool.make(
@@ -676,9 +711,69 @@ def train_step(agent_train_states, batch, gamma, lam):
         params=new_params,
         batch_stats=new_bstats,
         opt_state=new_opt_states,
-        n_updates=agent_train_states.n_updates + 1
+        n_updates=agent_train_states.n_updates + 1,
+        grad_steps=agent_train_states.grad_steps + 1
     )
     return new_train_states, loss_vals
+
+@partial(jax.jit, static_argnums=(2, 3, 4))
+def batched_train_step(
+    agent_train_states: TrainState,
+    batch: Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray],
+    gamma: float,
+    lam: float,
+    num_minibatches: int,
+) -> Tuple[TrainState, jnp.ndarray]:
+    """
+    Batches the training data into minibatches and performs a gradient update for each minibatch.
+
+    Args:
+        agent_train_states: A batched CustomTrainState (for each agent).
+        batch: A tuple (obs_b, nxt_b, act_b, rew_b, don_b) with shapes:
+             obs_b:  (B, N, S, *obs_shape)
+             nxt_b:  (B, N, S, *obs_shape)
+             act_b:  (B, N, S)
+             rew_b:  (B, N, S)
+             don_b:  (B, N, S)
+        gamma: Discount factor (float).
+        lam: TD(λ) parameter (float, typically between 0 and 1).
+        num_minibatches: The number of minibatches to divide the training data into.
+
+    Returns:
+        A tuple containing:
+            - new_train_states: The updated training states after processing all minibatches.
+            - jnp.mean(loss_vals): Mean of loss values across minibatches.
+    """
+    obs_b, nxt_b, act_b, rew_b, don_b = batch
+
+    batch_size = obs_b.shape[0]
+    minibatch_size = int(batch_size // num_minibatches)
+
+    def scan_minibatch(carry, i):
+        agent_train_states = carry
+        start = i * minibatch_size
+
+        mini_obs = jax.lax.dynamic_slice(obs_b, (start, 0, 0, 0, 0, 0), (minibatch_size,) + obs_b.shape[1:]) 
+        mini_nxt = jax.lax.dynamic_slice(nxt_b, (start, 0, 0, 0, 0, 0), (minibatch_size,) + nxt_b.shape[1:])  
+        mini_act = jax.lax.dynamic_slice(act_b, (start, 0, 0), (minibatch_size,) + act_b.shape[1:])
+        mini_rew = jax.lax.dynamic_slice(rew_b, (start, 0, 0), (minibatch_size,) + rew_b.shape[1:])
+        mini_don = jax.lax.dynamic_slice(don_b, (start, 0, 0), (minibatch_size,) + don_b.shape[1:])
+
+        mini_batch = (mini_obs, mini_nxt, mini_act, mini_rew, mini_don)
+
+        new_train_states, loss_vals = train_step(
+            agent_train_states, mini_batch, gamma, lam
+        )
+        return new_train_states, loss_vals
+
+    # Perform scan to train over all minibatches
+    init_carry = agent_train_states
+    new_train_states, loss_vals = jax.lax.scan(
+        scan_minibatch, init_carry, jnp.arange(num_minibatches)
+    )
+
+    # The result of the training gets compiled and then gets returned
+    return new_train_states, jnp.mean(loss_vals)
 
 def qnm_algorithm(
     config,
@@ -690,27 +785,17 @@ def qnm_algorithm(
     eps_scheduler,
     batched_init_obs,
     batched_env_state,
-    eval_env=None,
-    current_iter=0,
-    eval_batched_obs=None,
-    eval_batched_env_state=None
+    current_iter=0
 ):
-    """
-    Runs one iteration of the QNM algorithm:
-      - Generates a training trajectory using the current (exploratory) policy.
-      - Uses transitions to update the network.
-      - If an evaluation environment is provided and current_iter is a multiple of EVAL_EVERY,
-        performs a rollout using greedy (ε=0) actions, logs evaluation metrics, and returns the
-        updated evaluation environment state to continue from next iteration.
-    """
-
     # Hyperparameters
     N = config['alg']['NUM_AGENTS']
     S = config['alg']['NUM_STEPS']
     gamma = config['alg'].get('GAMMA', 0.99)
     lam = config['alg'].get('LAMBDA', 0.9)
+    E_train = config['alg']["NUM_ENVS"]
+    E_eval = config['alg'].get("TEST_ENVS", 0) if config['alg'].get("TEST_DURING_TRAINING", False) else 0  # NEW
 
-    # --- Training Rollout ---
+    # --- Training Rollout with combined envs ---
     (next_obs, next_env_state, new_rng), (transitions, infos) = generate_trajectory(
         network,
         agent_train_states,
@@ -720,20 +805,50 @@ def qnm_algorithm(
         batched_env_state,
         rng,
         eps_scheduler,
+        num_eval_envs=E_eval 
     )
 
-    # Average Q-values at chosen actions (just for logging)
+    agent_train_states = agent_train_states.replace(
+        timesteps=agent_train_states.timesteps + S * (E_train + E_eval)  
+    )
+
+    # --- Split transitions and infos into training and evaluation parts ---
+    if config['alg'].get('TEST_DURING_TRAINING', False) and E_eval > 0:
+        # Assuming the env dimension is the 2nd axis
+        slicing_fnct = lambda x: x[:, :, :E_train]
+        transitions_train = jax.tree_map(slicing_fnct, transitions)  
+        transitions_eval = jax.tree_map(slicing_fnct, transitions)   
+        infos_train = jax.tree_map(slicing_fnct, infos)
+        infos_eval = jax.tree_map(slicing_fnct, infos)
+    else:
+        transitions_train = transitions
+        infos_train = infos
+        infos_eval = None
+
+    # --- Metrics Calculations (using training env infos) ---
+    mask = infos_train["returned_episode"]  # Shape (S, N, E_train)
+    masked_returns = jnp.where(mask, infos_train["returned_episode_returns"], jnp.nan)
+    masked_lengths = jnp.where(mask, infos_train["returned_episode_lengths"], jnp.nan)
+    masked_norm_returns = jnp.where(mask, infos_train["normalized_returned_episode_returns"], jnp.nan)
+
+    mean_completed_returns = jnp.nan_to_num(jnp.nanmean(masked_returns, axis=(0, 2)))
+    mean_completed_lengths = jnp.nan_to_num(jnp.nanmean(masked_lengths, axis=(0, 2)))
+    mean_completed_norm_returns = jnp.nan_to_num(jnp.nanmean(masked_norm_returns, axis=(0, 2)))
+
     qvals = jnp.mean(
         jnp.take_along_axis(
-            transitions.q_val,
-            transitions.action[..., None],
+            transitions_train.q_val,
+            transitions_train.action[..., None],
             axis=-1
         ).squeeze(-1),
         axis=(0, 2)
     )
 
-    # Compute environment metrics and log them
-    metrics = {k: jnp.mean(v, axis=(0, 2)) for k, v in infos.items()}
+    # Log training metrics using infos_train
+    metrics = {k: jnp.mean(v, axis=(0, 2)) for k, v in infos_train.items()}
+    metrics['mean_completed_returns'] = mean_completed_returns
+    metrics['mean_completed_lengths'] = mean_completed_lengths
+    metrics['mean_completed_norm_returns'] = mean_completed_norm_returns
     metrics_np = {k: np.array(val) for k, val in metrics.items()}
     for i in range(N):
         agent_metrics = {k: float(metrics_np[k][i]) for k in metrics_np}
@@ -742,14 +857,13 @@ def qnm_algorithm(
             step=int(agent_train_states.n_updates[i])
         )
 
-    # Rearrange transitions into blocks of shape (B, N, S, ...)
-    obs_block  = jnp.transpose(transitions.obs,      (2, 1, 0) + tuple(range(3, transitions.obs.ndim)))
-    next_block = jnp.transpose(transitions.next_obs, (2, 1, 0) + tuple(range(3, transitions.next_obs.ndim)))
-    act_block  = jnp.transpose(transitions.action,   (2, 1, 0))
-    rew_block  = jnp.transpose(transitions.reward,   (2, 1, 0))
-    don_block  = jnp.transpose(transitions.done,     (2, 1, 0))
+    # --- Rearranging transitions for training update (only training envs) ---
+    obs_block  = jnp.transpose(transitions_train.obs,      (2, 1, 0) + tuple(range(3, transitions_train.obs.ndim)))
+    next_block = jnp.transpose(transitions_train.next_obs, (2, 1, 0) + tuple(range(3, transitions_train.next_obs.ndim)))
+    act_block  = jnp.transpose(transitions_train.action,   (2, 1, 0))
+    rew_block  = jnp.transpose(transitions_train.reward,   (2, 1, 0))
+    don_block  = jnp.transpose(transitions_train.done,     (2, 1, 0))
 
-    # Either sample directly (SKIP_REPLAY_BUFFER) or store to disk + sample from there
     if config['alg'].get('SKIP_REPLAY_BUFFER', False):
         batch = (obs_block, next_block, act_block, rew_block, don_block)
     else:
@@ -757,65 +871,66 @@ def qnm_algorithm(
         if len(disk_replay_buffer) < config["alg"].get("MIN_DISK_SIZE", 1):
             print("Not enough transitions on disk yet. Skipping update.")
             return agent_train_states, new_rng, None, None
-        # Sample from the replay buffer
         B = config["alg"].get("MINIBATCH_SIZE", 128)
         batch = disk_replay_buffer.sample_block(B)
 
-    # Perform a training step
-    new_train_states, loss_vals = train_step(agent_train_states, batch, gamma, lam)
+    # --- Training Step with Epochs remains the same ---
+    def train_epoch(carry, _):
+        agent_train_states, loss_val = carry
+        new_agent_train_states, loss_vals = batched_train_step(
+            agent_train_states, batch, gamma, lam, config['alg']['NUM_MINIBATCHES']
+        )
+        loss_val = jnp.mean(loss_vals)
+        return (new_agent_train_states, loss_val), None
+        
+    init_carry = (agent_train_states, jnp.array(0.0))
+    (new_agent_train_states, final_loss_val), _ = jax.lax.scan(
+        train_epoch, init_carry, jnp.arange(config['alg']['NUM_EPOCHS'])
+    )
 
-    # Log training metrics
+    loss_vals = final_loss_val
+
     for i in range(N):
-        eps_val = float(eps_scheduler(new_train_states.n_updates[i]))
+        eps_val = float(eps_scheduler(new_agent_train_states.n_updates[i]))
         agent_metrics = {
-            "env_step": float(new_train_states.timesteps[i]),
-            "update_steps": float(new_train_states.n_updates[i]),
-            "env_frame": float(new_train_states.timesteps[i] * env.single_observation_space.shape[0]),
-            "grad_steps": float(new_train_states.grad_steps[i]),
-            "td_loss": float(loss_vals[i]),
+            "env_step": float(new_agent_train_states.timesteps[i]),
+            "update_steps": float(new_agent_train_states.n_updates[i]),
+            "env_frame": float(new_agent_train_states.timesteps[i] * env.single_observation_space.shape[0]),
+            "grad_steps": float(new_agent_train_states.grad_steps[i]),
+            "td_loss": float(loss_vals),
             "qvals": float(qvals[i]),
-            "epsilon": eps_val, 
+            "epsilon": eps_val,
         }
         wandb.log(
             {f"agent_{i}/metrics": agent_metrics},
-            step=int(new_train_states.n_updates[i])
+            step=int(new_agent_train_states.n_updates[i])
         )
 
-    # --- Evaluation Rollout ---
-    eval_every = config['alg'].get("EVAL_EVERY", 1000)
-    eval_steps = config['alg'].get("EVAL_STEPS", S)
+    # --- Optionally log evaluation metrics from the evaluation envs ---
+    if infos_eval is not None:
+        eval_mask = infos_eval["returned_episode"]
+        eval_masked_returns = jnp.where(eval_mask, infos_eval["returned_episode_returns"], jnp.nan)
+        eval_masked_lengths = jnp.where(eval_mask, infos_eval["returned_episode_lengths"], jnp.nan)
+        eval_masked_norm_returns = jnp.where(eval_mask, infos_eval["normalized_returned_episode_returns"], jnp.nan)
 
-    # If we have an eval_env and it's time to evaluate, do a greedy rollout
-    new_eval_obs, new_eval_env_state = eval_batched_obs, eval_batched_env_state
-    if eval_env is not None and (current_iter % eval_every == 0) and (eval_batched_obs is not None) and (eval_batched_env_state is not None):
-        (final_obs, final_env_state, final_rng), (eval_transitions, eval_infos) = generate_trajectory(
-            network,
-            new_train_states,
-            eval_steps,
-            eval_env,
-            eval_batched_obs,
-            eval_batched_env_state,
-            new_rng,
-            constant_zero_eps_scheduler,
-        )
-        # Update the eval RNG in case you want to keep it around, or you could just discard it
-        new_rng = final_rng
-        new_eval_obs = final_obs
-        new_eval_env_state = final_env_state
+        eval_mean_returns = jnp.nan_to_num(jnp.nanmean(eval_masked_returns, axis=(0, 2)))
+        eval_mean_lengths = jnp.nan_to_num(jnp.nanmean(eval_masked_lengths, axis=(0, 2)))
+        eval_mean_norm_returns = jnp.nan_to_num(jnp.nanmean(eval_masked_norm_returns, axis=(0, 2)))
 
-        # Compute and log eval metrics
-        eval_metrics = {k: jnp.mean(v, axis=(0, 2)) for k, v in eval_infos.items()}
+        eval_metrics = {k: jnp.mean(v, axis=(0, 2)) for k, v in infos_eval.items()}
+        eval_metrics['eval_mean_returns'] = eval_mean_returns
+        eval_metrics['eval_mean_lengths'] = eval_mean_lengths
+        eval_metrics['eval_mean_norm_returns'] = eval_mean_norm_returns
         eval_metrics_np = {k: np.array(val) for k, val in eval_metrics.items()}
         for i in range(N):
             agent_eval_metrics = {k: float(eval_metrics_np[k][i]) for k in eval_metrics_np}
             wandb.log(
                 {f"agent_{i}/eval_env_metrics": agent_eval_metrics},
-                step=int(new_train_states.n_updates[i])
+                step=int(new_agent_train_states.n_updates[i])
             )
 
-    # Return the updated train states, RNG, and possibly updated evaluation env state
-    return new_train_states, new_rng, next_env_state, next_obs, new_eval_env_state, new_eval_obs
-
+    # Return the updated train states, RNG, and the new env state and observations (which include both training and eval)
+    return new_agent_train_states, new_rng, next_env_state, next_obs
 
 @hydra.main(version_base=None, config_path="./config", config_name="config")
 def main(config):
@@ -829,10 +944,12 @@ def main(config):
 
     rng = jax.random.PRNGKey(config["SEED"])
     num_agents = config['alg']["NUM_AGENTS"]
-    E = config['alg']["NUM_ENVS"]
+    E_train = config['alg']["NUM_ENVS"]
+    E_eval = config['alg'].get("TEST_ENVS", 0) if config['alg'].get("TEST_DURING_TRAINING", False) else 0
+    total_envs_per_agent = E_train + E_eval
     S = config['alg']["NUM_STEPS"]
     mini_buffer_size = config["alg"]["MINI_BUFFER_SIZE"]
-    total_envs = num_agents * E
+    total_envs = num_agents * total_envs_per_agent
 
     # Split the key into one per agent
     agent_rngs = jax.random.split(rng, num_agents)
@@ -840,7 +957,7 @@ def main(config):
     # 1) Create training environment
     env = make_env(total_envs, config)
     init_obs, env_state = env.reset()
-    batched_init_obs = init_obs.reshape(num_agents, E, *init_obs.shape[1:])
+    batched_init_obs = init_obs.reshape(num_agents, total_envs_per_agent, *init_obs.shape[1:])
 
     # 2) Create the QNetwork and agent train states
     network = QNetwork(
@@ -868,14 +985,6 @@ def main(config):
         transition_steps=int(config["NUM_UPDATES_DECAY"] * config['alg']["EPS_DECAY"]),
     )
 
-    # 5) Create a single evaluation environment if configured.
-    eval_env = None
-    if config['alg'].get("TEST_ENVS", 0) > 0:
-        total_eval_envs = num_agents * config['alg']["TEST_ENVS"]
-        eval_env = make_env(total_eval_envs, config)
-        eval_obs, eval_env_state = eval_env.reset()
-        batched_eval_obs = eval_obs.reshape(num_agents, config['alg']["TEST_ENVS"], *eval_obs.shape[1:])
-
     alg_name = config.get("ALG_NAME", "qnm")
     env_name = config.get("ENV_NAME", "NAN")
 
@@ -895,21 +1004,17 @@ def main(config):
 
     num_iters = int(config['alg']["TRAINING_ITERATIONS"])
     for iteration in range(num_iters):
-        # Pass the current iteration and the vectorized PRNG keys into qnm_algorithm.
-        agent_train_states, agent_rngs, env_state, obs, eval_env_state, batched_eval_obs = qnm_algorithm(
+        agent_train_states, agent_rngs, env_state, obs =  qnm_algorithm(
             config,
             agent_train_states,
             disk_replay_buffer,
             network,
-            agent_rngs,  # use vectorized keys
+            agent_rngs,  
             env,
             eps_scheduler,
             obs,
             env_state,
-            eval_env=eval_env,
-            current_iter=iteration,
-            eval_batched_obs=batched_eval_obs,
-            eval_batched_env_state=eval_env_state
+            current_iter=iteration
         )
         print(f"Iteration {iteration} complete. Disk buffer size={len(disk_replay_buffer)}")
 

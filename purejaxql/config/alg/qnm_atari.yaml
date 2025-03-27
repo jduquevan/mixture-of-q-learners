@@ -7,7 +7,7 @@ EPS_START: 1.
 EPS_FINISH: 0.001
 EPS_DECAY: 0.1 # ratio of total updates
 NUM_EPOCHS: 2 # number of epochs per update
-NUM_MINIBATCHES: 32 # minibatches per epoch
+NUM_MINIBATCHES: 4 # minibatches per epoch
 NORM_TYPE: "layer_norm" # layer_norm or batch_norm
 LR: 0.00025
 MAX_GRAD_NORM: 10
