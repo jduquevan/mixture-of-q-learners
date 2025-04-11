@@ -185,6 +185,7 @@ class JaxLogEnvPoolWrapper(gym.Wrapper):
         normalize_score = lambda x: (x - self.env_random_score) / (
             self.env_human_score - self.env_random_score
         )
+        infos["cumulative_episode_returns"] = state.episode_returns
         infos["returned_episode_returns"] = state.returned_episode_returns
         infos["normalized_returned_episode_returns"] = normalize_score(
             state.returned_episode_returns
@@ -618,6 +619,49 @@ def initialize_agents(config, env, rng):
     batched_train_states = vectorized_create_agent(rngs)
     return batched_train_states
 
+def compute_targets_stable(reward: jnp.ndarray,
+                           done: jnp.ndarray,
+                           q_next: jnp.ndarray,
+                           gamma: float,
+                           lam: float) -> jnp.ndarray:
+    """
+    Compute TD(λ) targets
+    Args:
+      reward: shape [T, ...] each step's reward
+      done:   shape [T, ...] each step's done mask (0 or 1)
+      q_next: shape [T, ..., num_actions] each step's Q-values
+      gamma:  discount factor
+      lam:    λ parameter
+    Returns:
+      shape [T, ...] of λ-returns
+    """
+    last_q = jnp.max(q_next[-1], axis=-1)
+    lambda_returns = reward[-1] + gamma * (1.0 - done[-1]) * last_q
+
+    def _backward_scan(carry, x):
+        """
+        carry: (lambda_returns, next_q)
+        x: (reward_t, qvals_t, done_t)
+        """
+        ret, next_q_val = carry
+        rew_t, qvals_t, done_t = x
+        target_bootstrap = rew_t + gamma * (1.0 - done_t) * next_q_val
+        delta = ret - next_q_val
+        ret = target_bootstrap + gamma * lam * delta
+        ret = (1.0 - done_t) * ret + done_t * rew_t
+        next_q_val = jnp.max(qvals_t, axis=-1)
+
+        return (ret, next_q_val), ret
+
+    (final_ret, _), targets = jax.lax.scan(
+        _backward_scan,
+        (lambda_returns, last_q),
+        (reward[:-1], q_next[:-1], done[:-1]),
+        reverse=True
+    )
+    targets = jnp.concatenate([targets, lambda_returns[None]], axis=0)
+    return targets
+
 @partial(jax.jit, static_argnums=(2, 3))
 def train_step(agent_train_states, batch, gamma, lam):
     """
@@ -636,22 +680,6 @@ def train_step(agent_train_states, batch, gamma, lam):
     Returns: (new_train_states, loss_vals)
     """
     obs_b, nxt_b, act_b, rew_b, don_b = batch
-
-    def compute_targets_stable(reward, done, q_next, gamma, lam):
-        lambda_returns = reward[-1] + gamma * (1 - done[-1]) * jnp.max(q_next[-1])
-        last_q = jnp.max(q_next[-1])
-        def _get_target(carry, x):
-            rew, q, d = x
-            target_bootstrap = rew + gamma * (1 - d) * carry[1]
-            delta = carry[0] - carry[1]
-            lambda_ret = target_bootstrap + gamma * lam * delta
-            lambda_ret = (1 - d) * lambda_ret + d * rew
-            next_q = jnp.max(q)
-            return (lambda_ret, next_q), lambda_ret
-        xs = (reward[:-1], q_next[:-1], done[:-1])
-        (_, _), targets = jax.lax.scan(_get_target, (lambda_returns, last_q), xs, reverse=True)
-        targets = jnp.concatenate([targets, jnp.array([lambda_returns])])
-        return targets
 
     def per_agent_multistep_loss(params, bstat, obs, nxt, act, rew, done):
         B_, S_ = obs.shape[:2]
@@ -815,25 +843,16 @@ def qnm_algorithm(
     # --- Split transitions and infos into training and evaluation parts ---
     if config['alg'].get('TEST_DURING_TRAINING', False) and E_eval > 0:
         # Assuming the env dimension is the 2nd axis
-        slicing_fnct = lambda x: x[:, :, :E_train]
-        transitions_train = jax.tree_map(slicing_fnct, transitions)  
-        transitions_eval = jax.tree_map(slicing_fnct, transitions)   
-        infos_train = jax.tree_map(slicing_fnct, infos)
-        infos_eval = jax.tree_map(slicing_fnct, infos)
+        slicing_fnct_train = lambda x: x[:, :, :E_train]
+        slicing_fnct_eval = lambda x: x[:, :, E_train:]
+        transitions_train = jax.tree_map(slicing_fnct_train, transitions)  
+        transitions_eval = jax.tree_map(slicing_fnct_eval, transitions)   
+        infos_train = jax.tree_map(slicing_fnct_train, infos)
+        infos_eval = jax.tree_map(slicing_fnct_eval, infos)
     else:
         transitions_train = transitions
         infos_train = infos
         infos_eval = None
-
-    # --- Metrics Calculations (using training env infos) ---
-    mask = infos_train["returned_episode"]  # Shape (S, N, E_train)
-    masked_returns = jnp.where(mask, infos_train["returned_episode_returns"], jnp.nan)
-    masked_lengths = jnp.where(mask, infos_train["returned_episode_lengths"], jnp.nan)
-    masked_norm_returns = jnp.where(mask, infos_train["normalized_returned_episode_returns"], jnp.nan)
-
-    mean_completed_returns = jnp.nan_to_num(jnp.nanmean(masked_returns, axis=(0, 2)))
-    mean_completed_lengths = jnp.nan_to_num(jnp.nanmean(masked_lengths, axis=(0, 2)))
-    mean_completed_norm_returns = jnp.nan_to_num(jnp.nanmean(masked_norm_returns, axis=(0, 2)))
 
     qvals = jnp.mean(
         jnp.take_along_axis(
@@ -846,9 +865,6 @@ def qnm_algorithm(
 
     # Log training metrics using infos_train
     metrics = {k: jnp.mean(v, axis=(0, 2)) for k, v in infos_train.items()}
-    metrics['mean_completed_returns'] = mean_completed_returns
-    metrics['mean_completed_lengths'] = mean_completed_lengths
-    metrics['mean_completed_norm_returns'] = mean_completed_norm_returns
     metrics_np = {k: np.array(val) for k, val in metrics.items()}
     for i in range(N):
         agent_metrics = {k: float(metrics_np[k][i]) for k in metrics_np}
@@ -908,19 +924,7 @@ def qnm_algorithm(
 
     # --- Optionally log evaluation metrics from the evaluation envs ---
     if infos_eval is not None:
-        eval_mask = infos_eval["returned_episode"]
-        eval_masked_returns = jnp.where(eval_mask, infos_eval["returned_episode_returns"], jnp.nan)
-        eval_masked_lengths = jnp.where(eval_mask, infos_eval["returned_episode_lengths"], jnp.nan)
-        eval_masked_norm_returns = jnp.where(eval_mask, infos_eval["normalized_returned_episode_returns"], jnp.nan)
-
-        eval_mean_returns = jnp.nan_to_num(jnp.nanmean(eval_masked_returns, axis=(0, 2)))
-        eval_mean_lengths = jnp.nan_to_num(jnp.nanmean(eval_masked_lengths, axis=(0, 2)))
-        eval_mean_norm_returns = jnp.nan_to_num(jnp.nanmean(eval_masked_norm_returns, axis=(0, 2)))
-
         eval_metrics = {k: jnp.mean(v, axis=(0, 2)) for k, v in infos_eval.items()}
-        eval_metrics['eval_mean_returns'] = eval_mean_returns
-        eval_metrics['eval_mean_lengths'] = eval_mean_lengths
-        eval_metrics['eval_mean_norm_returns'] = eval_mean_norm_returns
         eval_metrics_np = {k: np.array(val) for k, val in eval_metrics.items()}
         for i in range(N):
             agent_eval_metrics = {k: float(eval_metrics_np[k][i]) for k in eval_metrics_np}
@@ -1016,7 +1020,7 @@ def main(config):
             env_state,
             current_iter=iteration
         )
-        print(f"Iteration {iteration} complete. Disk buffer size={len(disk_replay_buffer)}")
+        print(f"Iteration {iteration} complete. Disk buffer size={len(disk_replay_buffer)}.")
 
     print("Done training.")
 
