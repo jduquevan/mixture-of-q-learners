@@ -16,3 +16,8 @@ models/
 **.npz
 **.safetensorspurejaxql/.schemas
 purejaxql/.schemas
+load_env.sh
+pyproject.toml
+uv.lock
+
+

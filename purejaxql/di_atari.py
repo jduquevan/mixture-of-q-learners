@@ -1,3 +1,4 @@
+
 """
 When test_during_training is set to True, an additional number of parallel test environments are used to evaluate the agent during training using greedy actions,
 but not for training purposes. Stopping training for evaluation can be very expensive, as an episode in Atari can last for hundreds of thousands of steps.
@@ -530,7 +531,7 @@ def make_train(config):
 
             agent_train_states = agent_train_states.replace(
                 timesteps=agent_train_states.timesteps
-                + config["NUM_STEPS"] * config["NUM_AGENTS"]
+                + config["NUM_STEPS"] * config["NUM_AGENTS"] # TODO: shoudl we include the num_agents?
             )  # update timesteps count
             
             reshaped_last_obs = transitions.next_obs[-1].reshape((config["NUM_AGENTS"], config["NUM_ENVS"], *transitions.next_obs[-1].shape[1:]))
@@ -559,7 +560,7 @@ def make_train(config):
                     def agent_loss_and_update(ts, minibatch, target):
                         def _loss_fn(params):
                             q_vals, updates = network.apply(
-                                {"params": ts.params, "batch_stats": ts.batch_stats},
+                                {"params": params, "batch_stats": ts.batch_stats},
                                 minibatch.obs, train=True, mutable=["batch_stats"]
                             )
                             chosen_q = jnp.take_along_axis(q_vals, jnp.expand_dims(minibatch.action, axis=-1), axis=-1).squeeze(-1)
@@ -736,9 +737,16 @@ def tune(default_config):
 @hydra.main(version_base=None, config_path="./config", config_name="config")
 def main(config):
     config = OmegaConf.to_container(config)
+    print(config)
     if config["DEBUG"]:
         jax.config.update("jax_disable_jit", True)
+        import debugpy
+        debugpy.listen(5678)
+        print("Waiting for client to attach...")
+        debugpy.wait_for_client()
+        print("Client attached")
     print("Config:\n", OmegaConf.to_yaml(config))
+    
     if config["HYP_TUNE"]:
         tune(config)
     else:

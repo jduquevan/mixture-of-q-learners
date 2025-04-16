@@ -1,6 +1,7 @@
 defaults:
   - _self_
   - cluster@_global_: juan_mila.yaml
+  - alg: di_atari.yaml
 # experiment params
 NUM_SEEDS: 1
 SEED: 0
