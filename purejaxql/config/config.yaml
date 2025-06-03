@@ -1,7 +1,7 @@
 defaults:
   - _self_
   - cluster@_global_: juan_mila.yaml
-  - alg: di_atari.yaml
+  - alg: sacmix.yaml
 # experiment params
 NUM_SEEDS: 1
 SEED: 0
@@ -10,10 +10,10 @@ SEED: 0
 HYP_TUNE: False
 
 # debugging
-DEBUG: False
+DEBUG: True
 
 # wandb params
-WANDB_MODE: "online"  # set to online to activate wandb
+WANDB_MODE: "disabled"  # set to online to activate wandb
 ENTITY: "puredip"
 PROJECT: "Mixture-of-Q-learners"
 alg:
