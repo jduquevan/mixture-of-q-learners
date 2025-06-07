@@ -242,7 +242,7 @@ class ActorCritic(nn.Module):
     def setup(self):
         self.encoder = CNN(norm_type=self.norm_type, name="cnn")
         self.actor_head  = nn.Dense(self.action_dim, name="actor_head")
-        self.critic_head = nn.Dense(self.action_dim, name="critic_head")
+        self.critic_head = nn.Dense(1, name="critic_head")
         self.log_tau = self.param(
             "log_tau",
             lambda _: jnp.log(self.temperature_init)
@@ -276,7 +276,8 @@ class Transition:
     reward: chex.Array
     done: chex.Array
     next_obs: chex.Array
-    q_val: chex.Array
+    val: chex.Array
+    log_p: chex.Array
 
 class CriticState(TrainState):
     batch_stats: Any
@@ -388,6 +389,26 @@ def initialize_agents(config, env, rng, network):
     batched_critic_states, batched_actor_states = jax.vmap(lambda r: create_agent(env, network, config, lr, r))(rngs)
     return batched_critic_states, batched_actor_states
 
+def _compute_gae(values, rewards, dones, gamma, lam):
+    T, N = rewards.shape
+
+    def scan(carry, t):
+        gae, adv = carry                       # gae: (N,)
+        delta = rewards[t] + gamma * (1 - dones[t]) * values[t+1] - values[t]
+        gae   = delta + gamma * lam * (1 - dones[t]) * gae
+        adv   = adv.at[t].set(gae)
+        return (gae, adv), None
+
+    advantages = jnp.zeros_like(rewards)       # (T, N)
+    init_gae   = jnp.zeros_like(rewards[0])
+    (_, advantages), _ = jax.lax.scan(
+        scan,
+        (init_gae, advantages),
+        jnp.arange(T-1, -1, -1)
+    )
+    returns = advantages + values[:-1]
+    return advantages, returns
+
 def _compute_targets(logits_next, q_vals_next, reward, done, log_tau, config):
     probs, logp, _ = _policy_from_logits(logits_next)
     alpha = jnp.exp(log_tau)[None, :, None] 
@@ -487,7 +508,7 @@ def make_train(config):
                     actor_train_states,
                     last_obs.reshape((config["NUM_AGENTS"], envs_per_agent, *last_obs.shape[1:]))
                 )
-                q_vals = jax.vmap(
+                vals = jax.vmap(
                     lambda ts, obs: network.apply(
                         {"params": ts.params, "batch_stats": ts.batch_stats},
                         obs,
@@ -508,8 +529,11 @@ def make_train(config):
                         jnp.argmax(l_row[num_envs:], axis=-1)                  # test envs
                         ], axis=0)
                 )(logits, _rngs)
+
+                probs, log_ps, _ = _policy_from_logits(logits)
+                log_ps = jnp.take_along_axis(log_ps, new_action[..., None], -1).reshape((config["NUM_AGENTS"]*envs_per_agent, 1))
                 new_action = new_action.reshape((config["NUM_AGENTS"]*envs_per_agent, *new_action.shape[2:]))
-                q_vals = q_vals.reshape((config["NUM_AGENTS"]*envs_per_agent, *q_vals.shape[2:]))
+                vals = vals.reshape((config["NUM_AGENTS"]*envs_per_agent, *vals.shape[2:]))
 
                 new_obs, new_env_state, reward, new_done, info = env.step(
                     env_state, new_action
@@ -521,7 +545,8 @@ def make_train(config):
                     reward=config.get("REW_SCALE", 1) * reward,
                     done=new_done,
                     next_obs=new_obs,
-                    q_val=q_vals,
+                    val=vals,
+                    log_p=log_ps,
                 )
                 return (new_obs, new_env_state, rng), (transition, info)
 
@@ -559,33 +584,30 @@ def make_train(config):
                 timesteps=actor_train_states.timesteps
                 + config["NUM_STEPS"] * config["NUM_AGENTS"] 
             )
-
+            
             next_obs = transitions.next_obs.reshape(config["NUM_STEPS"], config["NUM_AGENTS"], config["NUM_ENVS"], *transitions.next_obs.shape[2:])
-            logits_next = jax.vmap(                            # ▸ over agents
-                lambda ats, obs_ae: jax.vmap(                  # ▸ over envs
-                    lambda obs_e: network.apply(
-                        {"params": ats.params,
-                        "batch_stats": ats.batch_stats},
-                        obs_e, train=False,
-                        method=ActorCritic.actor)
-                )(obs_ae)                             
-            )(actor_train_states, np.transpose(next_obs, (1, 2, 0, 3, 4, 5)))
-            logits_next = jnp.swapaxes(logits_next.reshape((config["NUM_AGENTS"]*config["NUM_ENVS"], config["NUM_STEPS"], -1)), 0, 1)
+            next_obs_last = next_obs[-1]
+            last_next_value = jax.vmap(                               # over agents
+                lambda cts, obs: network.apply(
+                    {"params": cts.params,
+                    "batch_stats": cts.batch_stats},
+                    obs,
+                    train=False,
+                    method=ActorCritic.critic
+                ).squeeze(-1)
+            )(critic_train_states, next_obs_last) 
+
+            values = jnp.concatenate([transitions.val.squeeze(-1),last_next_value.reshape((1, config["NUM_AGENTS"]*config["NUM_ENVS"]))], axis=0)
+
+            gae_advantages, lambda_targets  = _compute_gae(
+                values   = values,                 # (T+1, N)
+                rewards  = transitions.reward,     # (T  , N)
+                dones    = transitions.done,       # (T  , N)
+                gamma    = config["GAMMA"],
+                lam      = config["LAMBDA"],
+            )
+            gae_advantages = (gae_advantages - gae_advantages.mean()) / (gae_advantages.std() + 1e-8)
             
-            q_vals_next = jax.vmap(                            # ▸ over agents
-                lambda cts, obs_ae: jax.vmap(                  # ▸ over envs
-                    lambda obs_e: network.apply(
-                        {"params": cts.params,
-                        "batch_stats": cts.batch_stats},
-                        obs_e, train=False,
-                        method=ActorCritic.critic)
-                )(obs_ae)                             
-            )(critic_train_states, np.transpose(next_obs, (1, 2, 0, 3, 4, 5)))
-            q_vals_next = jnp.swapaxes(q_vals_next.reshape((config["NUM_AGENTS"]*config["NUM_ENVS"], config["NUM_STEPS"], -1)), 0, 1)
-            log_tau_batch = jnp.repeat(actor_train_states.params["log_tau"], config["NUM_ENVS"])
-            lambda_targets = _compute_targets(logits_next, q_vals_next, transitions.reward, transitions.done, log_tau_batch, config)
-            
-            # NETWORKS UPDATE
             def _learn_epoch(carry, _):
                 critic_train_states, actor_train_states, rng = carry
                 rng, _rng = jax.random.split(rng)
@@ -593,20 +615,22 @@ def make_train(config):
                 minibatches = jax.tree_util.tree_map(lambda x: jnp.swapaxes(x, 0, 1), minibatches)
                 targets = jax.tree_map(lambda x: preprocess_transitions_per_agent(x, _rng, config), lambda_targets)
                 targets = jax.tree_util.tree_map(lambda x: jnp.swapaxes(x, 0, 1), targets)
+                advantages = jax.tree_map(lambda x: preprocess_transitions_per_agent(x, _rng, config), gae_advantages)
+                advantages = jax.tree_util.tree_map(lambda x: jnp.swapaxes(x, 0, 1), advantages)
 
                 def _learn_phase(carry, minibatch_and_target):
                     critic_train_states, actor_train_states, rng = carry
-                    minibatch, target = minibatch_and_target
+                    minibatch, target, advantage = minibatch_and_target
                     def agent_loss_and_update(cts, ats, minibatch, target):
                         # Critic loss and update
                         def _critic_loss_fn(params):
-                            q_vals, updates = network.apply(
+                            pred_val, updates = network.apply(
                                 {"params": params, "batch_stats": cts.batch_stats},
                                 minibatch.obs, train=True, mutable=["batch_stats"],
                                 method=ActorCritic.critic
                             )
-                            chosen_q = jnp.take_along_axis(q_vals, jnp.expand_dims(minibatch.action, axis=-1), axis=-1).squeeze(-1)
-                            loss = 0.5 * jnp.mean((chosen_q - target) ** 2)
+                            pred_val = pred_val.squeeze(-1)
+                            loss = 0.5 * jnp.mean((pred_val - target) ** 2)
                             return loss, updates["batch_stats"]
                         (critic_loss, new_critic_bs), grads = jax.value_and_grad(_critic_loss_fn, has_aux=True)(cts.params)
                         updates, new_opt_state = cts.tx.update(grads, cts.opt_state, cts.params)
@@ -621,17 +645,20 @@ def make_train(config):
                                 method=ActorCritic.actor
                             )
                             probs, logp, entropy = _policy_from_logits(logits)
-                            q_values = network.apply(
-                                {"params": cts.params, "batch_stats": cts.batch_stats},
-                                minibatch.obs, train=False, mutable=False,
-                                method=ActorCritic.critic
-                            )
-                            alpha = jnp.exp(actor_params["log_tau"])
-                            actor_loss = jnp.mean(jnp.sum(probs * (alpha * logp - q_values), axis=-1))
-                            temp_loss = alpha * jnp.mean(-logp.sum(axis=-1))
-                            mean_ent = jnp.mean(entropy)
+                            
+                            logp_a = jnp.take_along_axis(logp, minibatch.action[..., None], -1).squeeze(-1)
+                            ratio  = jnp.exp(logp_a - minibatch.log_p.squeeze(-1))
 
-                            return actor_loss + temp_loss, (updates["batch_stats"], mean_ent)
+                            clip_eps = config["CLIP_EPS"]
+                            unclipped = ratio * advantage
+                            clipped   = jnp.clip(ratio, 1-clip_eps, 1+clip_eps) * advantage
+                            pg_loss   = -jnp.mean(jnp.minimum(unclipped, clipped))
+
+                            ent_loss = -jnp.mean(entropy)
+                            ent_coeff = config["ENT_COEFF"]
+
+                            return pg_loss + ent_coeff * ent_loss, (updates["batch_stats"], entropy.mean())
+
                         (actor_loss, (new_actor_bs, entropies)), grads = jax.value_and_grad(_actor_loss_fn, has_aux=True)(ats.params)
                         updates, new_opt_state = ats.tx.update(grads, ats.opt_state, ats.params)
                         new_actor_params = optax.apply_updates(ats.params, updates)
@@ -645,7 +672,7 @@ def make_train(config):
                     return (new_critic_train_states, new_actor_train_states, rng), (critic_loss, actor_loss, entropies)
         
                 rng, _rng = jax.random.split(rng)
-                (critic_train_states, actor_train_states, rng), (critic_losses, actor_losses, entropies) = jax.lax.scan(_learn_phase, (critic_train_states, actor_train_states, rng), (minibatches, targets))
+                (critic_train_states, actor_train_states, rng), (critic_losses, actor_losses, entropies) = jax.lax.scan(_learn_phase, (critic_train_states, actor_train_states, rng), (minibatches, targets, advantages))
                 
                 mean_entropies = jnp.mean(entropies, axis=0)
                 mean_critic_losses = jnp.mean(critic_losses, axis=0)

@@ -1,4 +1,4 @@
-ALG_NAME: "sacmix"
+ALG_NAME: "ppomix"
 TOTAL_TIMESTEPS: 5e7 # with 4 frame skip correpsnds to 200M frames
 TOTAL_TIMESTEPS_DECAY: 5e7 # will be used for decay functions (epsilon and lr)
 NUM_ENVS: 64 # parallel environments
@@ -15,6 +15,8 @@ LR_LINEAR_DECAY: False
 GAMMA: 0.99
 LAMBDA: 0.65
 NUM_AGENTS: 1
+CLIP_EPS: 0.1
+ENT_COEFF: 0.07
 
 # env specific, see https://envpool.readthedocs.io/en/latest/env/atari.html
 ENV_NAME: "Pong-v5"

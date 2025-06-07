@@ -1,7 +1,7 @@
 defaults:
   - _self_
   - cluster@_global_: juan_mila.yaml
-  - alg: sacmix.yaml
+  - alg: ppomix.yaml
 # experiment params
 NUM_SEEDS: 1
 SEED: 0
@@ -10,10 +10,10 @@ SEED: 0
 HYP_TUNE: False
 
 # debugging
-DEBUG: True
+DEBUG: False
 
 # wandb params
-WANDB_MODE: "disabled"  # set to online to activate wandb
+WANDB_MODE: "online"  # set to online to activate wandb
 ENTITY: "puredip"
 PROJECT: "Mixture-of-Q-learners"
 alg:
