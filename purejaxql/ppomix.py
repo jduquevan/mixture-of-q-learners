@@ -455,7 +455,6 @@ def make_train(config):
             action_dim = env.single_action_space.n,
             norm_type  = config["NORM_TYPE"],
             norm_input = config.get("NORM_INPUT", False),
-            temperature_init = config.get("TEMPERATURE_INIT", 1.0),
         )
 
         rng, _rng = jax.random.split(rng)
