@@ -236,22 +236,17 @@ class CNN(nn.Module):
 class ActorCritic(nn.Module):
     action_dim: int
     norm_type: str = "layer_norm"
-    norm_input: bool = False
-    temperature_init: float = 1.0          
+    norm_input: bool = False       
 
     def setup(self):
         self.encoder = CNN(norm_type=self.norm_type, name="cnn")
         self.actor_head  = nn.Dense(self.action_dim, name="actor_head")
         self.critic_head = nn.Dense(1, name="critic_head")
-        self.log_tau = self.param(
-            "log_tau",
-            lambda _: jnp.log(self.temperature_init)
-        )
         self.encoder_bn = nn.BatchNorm(momentum=0.99, epsilon=1e-5, name="encoder_bn")
     
     def actor(self, x, train: bool):
         feat = self._encode(x, train)
-        return self.actor_head(feat) / jnp.exp(self.log_tau)
+        return self.actor_head(feat)
 
     def critic(self, x, train: bool):
         feat = self._encode(x, train)
@@ -408,29 +403,6 @@ def _compute_gae(values, rewards, dones, gamma, lam):
     )
     returns = advantages + values[:-1]
     return advantages, returns
-
-def _compute_targets(logits_next, q_vals_next, reward, done, log_tau, config):
-    probs, logp, _ = _policy_from_logits(logits_next)
-    alpha = jnp.exp(log_tau)[None, :, None] 
-    soft_next_value = jnp.sum(probs * (q_vals_next - alpha * logp), axis=-1)
-
-    def _get_target(lambda_returns, inputs):
-        reward, done, soft_q = inputs
-        target_bootstrap = reward + config["GAMMA"] * (1 - done) * soft_q
-        delta = lambda_returns - soft_q
-        lambda_returns = target_bootstrap + config["GAMMA"] * config["LAMBDA"] * delta
-        lambda_returns = (1 - done) * lambda_returns + done * reward
-        return lambda_returns, lambda_returns
-
-    lambda_returns = reward[-1] + config["GAMMA"] * (1 - done[-1]) * soft_next_value[-1]
-    _, targets = jax.lax.scan(
-        _get_target,
-        lambda_returns,
-        (reward[:-1], done[:-1], soft_next_value[:-1]),
-        reverse=True,
-    )
-    targets = jnp.concatenate([targets, lambda_returns[None]], axis=0)
-    return targets
 
 def make_train(config):
     num_envs = config["NUM_ENVS"]
@@ -689,7 +661,6 @@ def make_train(config):
             mean_actor_losses = jnp.mean(actor_losses, axis=0)
             mean_entropies = jnp.mean(entropies, axis=0)
             env_metrics = compute_agent_metrics(infos, config)
-            taus = jnp.exp(actor_train_states.params['log_tau'])
             metrics = {}
             for i in range(config["NUM_AGENTS"]):
                 eps_val = eps_scheduler(critic_train_states.n_updates[i])
@@ -700,7 +671,6 @@ def make_train(config):
                 metrics[f"agent_{i}/td_loss"] = mean_critic_losses[i]
                 metrics[f"agent_{i}/policy_loss"] = mean_actor_losses[i]
                 metrics[f"agent_{i}/entropy"] = mean_entropies[i]
-                metrics[f"agent_{i}/policy_temperature"] = taus[i]
                 metrics[f"agent_{i}/epsilon"] = eps_val
                 
                 for k, v in env_metrics.items():
