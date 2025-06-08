@@ -444,12 +444,6 @@ def make_train(config):
     def train(rng):
         original_seed = rng[0]
 
-        eps_scheduler = optax.linear_schedule(
-            config["EPS_START"],
-            config["EPS_FINISH"],
-            (config["EPS_DECAY"]) * config["NUM_UPDATES_DECAY"],
-        )
-
         # INIT NETWORK AND OPTIMIZER
         network = ActorCritic(
             action_dim = env.single_action_space.n,
@@ -662,7 +656,6 @@ def make_train(config):
             env_metrics = compute_agent_metrics(infos, config)
             metrics = {}
             for i in range(config["NUM_AGENTS"]):
-                eps_val = eps_scheduler(critic_train_states.n_updates[i])
                 metrics[f"agent_{i}/env_step"] = critic_train_states.timesteps[i]
                 metrics[f"agent_{i}/update_steps"] = critic_train_states.n_updates[i]
                 metrics[f"agent_{i}/env_frame"] = critic_train_states.timesteps[i] * env.single_observation_space.shape[0]
@@ -670,7 +663,6 @@ def make_train(config):
                 metrics[f"agent_{i}/td_loss"] = mean_critic_losses[i]
                 metrics[f"agent_{i}/policy_loss"] = mean_actor_losses[i]
                 metrics[f"agent_{i}/entropy"] = mean_entropies[i]
-                metrics[f"agent_{i}/epsilon"] = eps_val
                 
                 for k, v in env_metrics.items():
                     metrics[f"agent_{i}/{k}"] = v[i]
