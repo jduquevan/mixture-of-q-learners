@@ -280,7 +280,7 @@ def preprocess_transitions_per_agent(x, rng, config):
     num_steps = x.shape[0]
     total_envs = x.shape[1]
     num_agents = config["NUM_AGENTS"]
-    num_envs = config["NUM_ENVS"]
+    num_envs = x.shape[1] // num_agents
     # First, transpose to (total_envs, num_steps, ...)
     x = jnp.transpose(x, (1, 0) + tuple(range(2, x.ndim)))
     # Then, reshape total_envs into (num_agents, num_envs)
@@ -291,22 +291,50 @@ def preprocess_transitions_per_agent(x, rng, config):
     rngs = jax.random.split(rng, num_agents)
     return jax.vmap(lambda x_agent, r: preprocess_agent_transition(x_agent, r, config), in_axes=(0, 0))(x, rngs)
 
-def compute_agent_metric(metric, config):
+def mix_transitions(x, config, final_indices):
+    # x: (num_steps, total_envs, ...), with total_envs = NUM_AGENTS * NUM_ENVS.
+    num_steps = x.shape[0]
     num_agents = config["NUM_AGENTS"]
-    num_steps = config["NUM_STEPS"]
-    num_envs = config["NUM_ENVS"]
-    test_envs = config.get("TEST_ENVS", 0)
-    envs_per_agent = num_envs + test_envs
+    num_envs = x.shape[1] // num_agents
+    # First, transpose to (total_envs, num_steps, ...)
+    x = jnp.transpose(x, (1, 0) + tuple(range(2, x.ndim)))
+    # Then, reshape total_envs into (num_agents, num_envs)
+    x = x.reshape((num_agents, num_envs, num_steps) + x.shape[2:])
+    # mix envs with final_indices
+    x = x[final_indices[0], final_indices[1], ...]
+    # Finally, transpose to (num_steps, num_agents, num_envs, ...)
+    x = jnp.transpose(x, (2, 0, 1) + tuple(range(3, x.ndim)))
+    # now get back to (num_steps, total_envs, ...)
+    x = x.reshape((num_steps, num_agents*num_envs) + x.shape[3:])
+    # return the mixed transitions
+    return x
 
-    metric = jnp.transpose(metric, (1, 0) + tuple(range(2, metric.ndim)))
-    metric = metric.reshape((num_agents, envs_per_agent, num_steps) + metric.shape[2:])
-    metric = metric[:, num_envs:]
-    metric = jnp.transpose(metric, (2, 0, 1) + tuple(range(3, metric.ndim)))
-    return jnp.mean(metric, axis=(0, 2))
-
+def update_buffer(buf, x, index, config):
+    num_steps = x.shape[0]
+    num_agents = config["NUM_AGENTS"]
+    num_envs = x.shape[1] // num_agents
+    # First, transpose to (total_envs, num_steps, ...)
+    x = jnp.transpose(x, (1, 0) + tuple(range(2, x.ndim)))
+    # Then, reshape total_envs into (num_agents, num_envs, num_steps, ...)
+    x = x.reshape((num_agents, num_envs, num_steps) + x.shape[2:])
+    # update the buffer
+    offsets = (0, index, 0) + (0,) * (buf.ndim - 3)
+    # write the whole block for all agents in one shot
+    buf = jax.lax.dynamic_update_slice(buf, x, offsets)
+    return buf
+    
+    
 def compute_agent_metrics(metrics, config):
+    def compute_agent_metric(metric, config):
+        num_agents = config["NUM_AGENTS"] # only read this from config, num_envs can vary as we feed train and test env separately
+        num_steps = metric.shape[0]
+        envs_per_agent = metric.shape[1] // num_agents
+        
+        metric = metric.reshape((num_steps, num_agents, envs_per_agent) + metric.shape[2:])
+        return jnp.mean(metric, axis=(0, 2))
+    
     return jax.tree_util.tree_map(
-        lambda m: compute_agent_metric(m, config) if isinstance(m, jnp.ndarray) and m.ndim >= 2 else m,
+        lambda m: compute_agent_metric(m, config),
         metrics,
     )
 
@@ -411,11 +439,15 @@ def make_train(config):
     num_envs = config["NUM_ENVS"]
     num_agents = config["NUM_AGENTS"]
     config["NUM_UPDATES"] = (
-        config["TOTAL_TIMESTEPS"] // config["NUM_STEPS"] // num_envs
+        config["TOTAL_TIMESTEPS"] // config["NUM_STEPS"] // (num_envs*num_agents)
     )
 
     config["NUM_UPDATES_DECAY"] = (
-        config["TOTAL_TIMESTEPS_DECAY"] // config["NUM_STEPS"] // num_envs
+        config["TOTAL_TIMESTEPS_DECAY"] // config["NUM_STEPS"] // (num_envs*num_agents)
+    )
+    
+    config["NUM_UPDATES_DECAY_2"] = (
+        config["TOTAL_TIMESTEPS_DECAY_2"] // config["NUM_STEPS"] // (num_envs*num_agents)
     )
 
     assert (config["NUM_STEPS"] * num_envs) % config[
@@ -452,6 +484,12 @@ def make_train(config):
             config["EPS_FINISH"],
             (config["EPS_DECAY"]) * config["NUM_UPDATES_DECAY"],
         )
+        
+        second_eps_scheduler = optax.linear_schedule(
+            config["EPS_START"],
+            config["EPS_FINISH"],
+            (config["EPS_DECAY"]) * config["NUM_UPDATES_DECAY_2"],
+        )
 
         # INIT NETWORK AND OPTIMIZER
         network = QNetwork(
@@ -462,12 +500,15 @@ def make_train(config):
 
         rng, _rng = jax.random.split(rng)
         agent_train_states = initialize_agents(config, env, rng, network)
+        # params_copy
+        params_copy = jax.tree.map(lambda x: x.copy(), agent_train_states.params)
+        
 
         # TRAINING LOOP
-        def _update_step(runner_state, unused):
+        def _update_step(runner_state, update_step):
             num_envs = config["NUM_ENVS"]
             envs_per_agent = num_envs + config["TEST_ENVS"] if config.get("TEST_DURING_TRAINING", False) else num_envs
-            agent_train_states, expl_state, test_metrics, rng = runner_state
+            agent_train_states, expl_state, test_metrics, rng, buffer, buffer_index, buffer_filled = runner_state
             # SAMPLE PHASE
             def _step_env(carry, _):
                 last_obs, env_state, rng = carry
@@ -477,7 +518,8 @@ def make_train(config):
                 )(agent_train_states, last_obs.reshape((config["NUM_AGENTS"], envs_per_agent, *last_obs.shape[1:])))
 
                 def get_eps_per_agent(n_updates):
-                    eps_train = jnp.full((config["NUM_ENVS"],), eps_scheduler(n_updates))
+                    eps = jnp.where(n_updates < config["EPS_SWITCH_POINT"], eps_scheduler(n_updates), second_eps_scheduler(n_updates))
+                    eps_train = jnp.full((config["NUM_ENVS"],), eps)
                     eps_test = jnp.zeros((config["TEST_ENVS"],))
                     return jnp.concatenate([eps_train, eps_test], axis=0)
                 
@@ -514,35 +556,154 @@ def make_train(config):
             expl_state = tuple(expl_state)
             
             if config.get("TEST_DURING_TRAINING", False):
-                # remove testing envs
-                def filter_transitions(x, config):
+                def filter_and_return_train(x, config):
                     num_agents = config["NUM_AGENTS"]
                     num_steps = config["NUM_STEPS"]
                     envs_per_agent = num_envs + config["TEST_ENVS"] if config.get("TEST_DURING_TRAINING", False) else num_envs
                     x = jnp.transpose(x, (1, 0) + tuple(range(2, x.ndim)))
                     x = x.reshape((num_agents, envs_per_agent, num_steps) + x.shape[2:])
-                    x = x[:, : -config["TEST_ENVS"]]
+                    x = x[:, : -config["TEST_ENVS"]] # the only difference from the filter_and_return_test is this line and the next one (as the number of envs is different)
                     x = x.reshape((num_agents*num_envs, num_steps) + x.shape[3:])
                     return jnp.transpose(x, (1, 0) + tuple(range(2, x.ndim)))
-
-                transitions = jax.tree.map(
-                    lambda x: filter_transitions(x, config), transitions
-                )
+                
+                def filter_and_return_test(x, config):
+                    num_agents = config["NUM_AGENTS"]
+                    num_steps = config["NUM_STEPS"]
+                    envs_per_agent = num_envs + config["TEST_ENVS"] if config.get("TEST_DURING_TRAINING", False) else num_envs
+                    x = jnp.transpose(x, (1, 0) + tuple(range(2, x.ndim)))
+                    x = x.reshape((num_agents, envs_per_agent, num_steps) + x.shape[2:])
+                    x = x[:, -config["TEST_ENVS"]:]
+                    x = x.reshape((num_agents*config["TEST_ENVS"], num_steps) + x.shape[3:])
+                    return jnp.transpose(x, (1, 0) + tuple(range(2, x.ndim)))
+                
+                train_infos = jax.tree_map(lambda x: filter_and_return_train(x, config), infos)
+                test_infos = jax.tree_map(lambda x: filter_and_return_test(x, config), infos)
+                infos = train_infos # to support both cases where we have test envs or not
+                
+                # remove the testing envs from the transitions
+                transitions = jax.tree.map(lambda x: filter_and_return_train(x, config), transitions)
+                
+                
+            # update the buffer
+            num_agents = config["NUM_AGENTS"]
+            num_envs_per_agent = transitions.obs.shape[1] // num_agents
+            buffer = jax.tree.map(lambda x, y: update_buffer(x, y, buffer_index, config), buffer, transitions)
+            buffer_index += num_envs_per_agent
+            buffer_index = buffer_index % config['BUFFER_PER_AGENT']
+            buffer_filled = jnp.minimum(buffer_filled+num_envs_per_agent, config['BUFFER_PER_AGENT'])
+            
+            # sample transitions to train on from the buffer
+            sample_indices = jax.random.randint(rng, (num_agents, num_envs_per_agent), 0, buffer_filled)
+            transitions = jax.vmap(lambda x, indices: jax.tree.map(lambda x: x[indices, ...], x))(buffer, sample_indices)
+            # from (num_agents, num_envs_per_agent, num_steps, ...) to (num_steps, num_agents*num_envs_per_agent, ...)
+            transitions = jax.tree.map(lambda x: jnp.transpose(x, (2, 0, 1) + tuple(range(3, x.ndim))), transitions)
+            transitions = jax.tree.map(lambda x: x.reshape((config["NUM_STEPS"], num_agents*num_envs_per_agent) + x.shape[3:]), transitions)
 
             agent_train_states = agent_train_states.replace(
                 timesteps=agent_train_states.timesteps
-                + config["NUM_STEPS"] * config["NUM_AGENTS"] # TODO: shoudl we include the num_agents?
+                + config["NUM_STEPS"] * config["NUM_AGENTS"] # TODO: should we include the num_agents?
             )  # update timesteps count
             
-            reshaped_last_obs = transitions.next_obs[-1].reshape((config["NUM_AGENTS"], config["NUM_ENVS"], *transitions.next_obs[-1].shape[1:]))
-
+            # compute the final indices
+            
+            
+            if config["RESET_SCHEDULE"] == 'no-reset':
+                reset_flag = False
+            elif config["RESET_SCHEDULE"] == 'reset-at-400mod500':  
+               reset_flag = update_step % 500 == 400
+            elif config["RESET_SCHEDULE"] == 'reset-at-3700mod4000':
+                reset_flag = update_step % 4000 == 3700
+            elif config["RESET_SCHEDULE"] == 'reset-once-at-500':
+                reset_flag = update_step == 500
+            elif config["RESET_SCHEDULE"] == 'two-resets-at-4000-and-6000':
+                reset_flag = ((update_step == 4000)) | ((update_step == 6000))
+            elif config["RESET_SCHEDULE"] == 'reset-once-at-1000':
+                reset_flag = update_step == 1000
+            else:
+                raise ValueError(f"reset_schedule {config['RESET_SCHEDULE']} not supported")
+            
+            # reset the agents    
+            new_params = jax.tree_util.tree_map(lambda p0, p: jax.lax.select(reset_flag, p0, p),  params_copy, agent_train_states.params)
+            agent_train_states = agent_train_states.replace(params=new_params)
+            
+            if config["MIX_SCHEDULE"] == 'no-mix':
+                p_mix = 0.0
+            elif config["MIX_SCHEDULE"] == 'mix-1.0-for-100-at-400mod500':  
+               p_mix = jnp.where(update_step % 500 < 400, 0.0, 1.0)
+            elif config["MIX_SCHEDULE"] == 'mix-1.0-for-300-at-3700mod4000':
+                p_mix = jnp.where(update_step % 4000 < 3700, 0.0, 1.0)
+            elif config["MIX_SCHEDULE"] == 'mix-1.0-for-200-at-300mod500':
+                p_mix = jnp.where(update_step % 500 < 300, 0.0, 1.0)
+            elif config["MIX_SCHEDULE"] == 'mix-always-0.5':
+                p_mix = 0.5
+            elif config["MIX_SCHEDULE"] == 'mix-always-1.0':
+                p_mix = 1.0
+            elif config["MIX_SCHEDULE"] == 'mix-at-500-til-700':
+                p_mix = jnp.where((update_step >= 500) & (update_step <= 700), 1.0, 0.0)
+            elif config["MIX_SCHEDULE"] == 'two-mix-for-500-at-4000-and-6000':
+                p_mix = jnp.where(((update_step >= 4000)  & (update_step <= 4500)) | ((update_step >= 6000) & (update_step <= 6500)), 1.0, 0.0)
+            else:
+                raise ValueError(f"mix_schedule {config['MIX_SCHEDULE']} not supported")
+            
+            # mix the transitions
+            num_agents = config["NUM_AGENTS"]
+            num_envs_per_agent = transitions.obs.shape[1] // num_agents
+            orig_indices = jnp.indices((num_agents, num_envs_per_agent))
+            mix_indices = jnp.indices((num_agents, num_envs_per_agent))
+            mix_indices = mix_indices.at[0].set(jax.random.randint(rng, (num_agents, num_envs_per_agent), 0, num_agents))
+            flag = jax.random.bernoulli(rng, p_mix, (num_agents, num_envs_per_agent))
+            final_indices = jnp.where(flag == 0, orig_indices, mix_indices)
+            
+            transitions = jax.tree.map(lambda x: mix_transitions(x, config, final_indices), transitions)
+            
+            # now we decide if to train all agents on the same data with some weights
+            if config["SHARE_STRATEGY"] == 'no-share':
+                weights = jnp.ones((num_agents, transitions.obs.shape[1] // num_agents))
+            elif config["SHARE_STRATEGY"] == 'share-0.2':
+                num_envs = transitions.obs.shape[1] // num_agents
+                transitions = jax.tree.map(lambda x: jnp.tile(x, (1, num_agents) + (1,) * (x.ndim - 2)), transitions)
+                weights = jnp.eye(num_agents).repeat(num_envs, axis=1)
+                num_envs_per_agent = transitions.obs.shape[1] // num_agents
+                weights = 0.8 * weights + 0.2
+            elif config["SHARE_STRATEGY"] == 'share-all':
+                num_envs = transitions.obs.shape[1] // num_agents
+                transitions = jax.tree.map(lambda x: jnp.tile(x, (1, num_agents) + (1,) * (x.ndim - 2)), transitions)
+                weights = jnp.eye(num_agents).repeat(num_envs, axis=1)
+                num_envs_per_agent = transitions.obs.shape[1] // num_agents
+                weights = 0.0 * weights + 1.0
+            elif config["SHARE_STRATEGY"] == 'share-after-1000':
+                num_envs = transitions.obs.shape[1] // num_agents
+                transitions = jax.tree.map(lambda x: jnp.tile(x, (1, num_agents) + (1,) * (x.ndim - 2)), transitions)
+                weights = jnp.eye(num_agents).repeat(num_envs, axis=1)
+                num_envs_per_agent = transitions.obs.shape[1] // num_agents
+                weights = jnp.where(update_step < 1000, weights, 1.0)
+            else:
+                raise ValueError(f"SHARE_STRATEGY {config['SHARE_STRATEGY']} not supported")
+        
+            
+            def _compute_q_vals(carry, last_obs):
+                q_vals = jax.vmap(
+                    lambda ts, obs: network.apply({"params": ts.params, "batch_stats": ts.batch_stats}, obs, train=False)
+                )(agent_train_states, last_obs.reshape((config["NUM_AGENTS"], num_envs_per_agent, *last_obs.shape[1:])))
+                q_vals = q_vals.reshape((config["NUM_AGENTS"]*num_envs_per_agent, *q_vals.shape[2:]))
+                return None, q_vals
+            
+            _, q_vals = jax.lax.scan(
+                _compute_q_vals,
+                None, # carry
+                transitions.obs,
+                config["NUM_STEPS"],
+            )
+            
+            # recomputing the q_vals as we have mixed the transitions
+            reshaped_last_obs = transitions.next_obs[-1].reshape((config["NUM_AGENTS"], num_envs_per_agent, *transitions.next_obs[-1].shape[1:]))
             last_q = jax.vmap(
                 lambda ts, obs: network.apply({"params": ts.params, "batch_stats": ts.batch_stats}, obs, train=False)
             )(agent_train_states, reshaped_last_obs)
-            last_q = jnp.max(last_q, axis=-1).reshape((config["NUM_ENVS"]*config["NUM_AGENTS"]))
+            last_q = jnp.max(last_q, axis=-1).reshape((num_envs_per_agent*config["NUM_AGENTS"]))
             
             lambda_targets = _compute_targets(
-                last_q, transitions.q_val, transitions.reward, transitions.done, config
+                last_q, q_vals, transitions.reward, transitions.done, config
             )
 
             # NETWORKS UPDATE
@@ -557,22 +718,22 @@ def make_train(config):
                 def _learn_phase(carry, minibatch_and_target):
                     agent_train_states, rng = carry
                     minibatch, target = minibatch_and_target
-                    def agent_loss_and_update(ts, minibatch, target):
+                    def agent_loss_and_update(ts, minibatch, target, ws):
                         def _loss_fn(params):
                             q_vals, updates = network.apply(
                                 {"params": params, "batch_stats": ts.batch_stats},
                                 minibatch.obs, train=True, mutable=["batch_stats"]
                             )
                             chosen_q = jnp.take_along_axis(q_vals, jnp.expand_dims(minibatch.action, axis=-1), axis=-1).squeeze(-1)
-                            loss = 0.5 * jnp.mean((chosen_q - target) ** 2)
+                            loss = 0.5 * jnp.mean(((chosen_q - target) ** 2) * ws)
                             return loss, updates["batch_stats"]
                         (loss, new_bs), grads = jax.value_and_grad(_loss_fn, has_aux=True)(ts.params)
                         updates, new_opt_state = ts.tx.update(grads, ts.opt_state, ts.params)
                         new_params = optax.apply_updates(ts.params, updates)
                         return loss, ts.replace(params=new_params, batch_stats=new_bs, opt_state=new_opt_state, grad_steps=ts.grad_steps+1)
                     
-                    losses, new_agent_train_states = jax.vmap(agent_loss_and_update, in_axes=(0,0,0))(
-                        agent_train_states, minibatch, target
+                    losses, new_agent_train_states = jax.vmap(agent_loss_and_update, in_axes=(0,0,0,0))(
+                        agent_train_states, minibatch, target, weights
                     )
                     return (new_agent_train_states, rng), losses
                 rng, _rng = jax.random.split(rng)
@@ -588,7 +749,12 @@ def make_train(config):
             agent_train_states = agent_train_states.replace(n_updates=agent_train_states.n_updates + 1)
             losses = jnp.mean(losses, axis=0)
 
-            env_metrics = compute_agent_metrics(infos, config)
+            env_train_metrics = compute_agent_metrics(infos, config)
+            if config.get("TEST_DURING_TRAINING", False):
+                env_test_metrics = compute_agent_metrics(test_infos, config)
+            else:
+                env_test_metrics = {}
+                
             metrics = {}
             for i in range(config["NUM_AGENTS"]):
                 eps_val = eps_scheduler(agent_train_states.n_updates[i])
@@ -597,10 +763,12 @@ def make_train(config):
                 metrics[f"agent_{i}/env_frame"] = agent_train_states.timesteps[i] * env.single_observation_space.shape[0]
                 metrics[f"agent_{i}/grad_steps"] = agent_train_states.grad_steps[i]
                 metrics[f"agent_{i}/td_loss"] = losses[i]
-                metrics[f"agent_{i}/epsilon"] = eps_val
+                metrics[f"agent_{i}/epsilon"] = eps_val #TODO: add lr scheduler
                 
-                for k, v in env_metrics.items():
-                    metrics[f"agent_{i}/{k}"] = v[i]
+                for k, v in env_train_metrics.items():
+                    metrics[f"agent_{i}/train_{k}"] = v[i]
+                for k, v in env_test_metrics.items():
+                    metrics[f"agent_{i}/test_{k}"] = v[i]
             
             # report on wandb if required
             if config["WANDB_MODE"] != "disabled":
@@ -617,26 +785,40 @@ def make_train(config):
 
                 jax.debug.callback(callback, metrics, original_seed)
 
-            runner_state = (agent_train_states, tuple(expl_state), test_metrics, rng)
+            runner_state = (agent_train_states, tuple(expl_state), test_metrics, rng, buffer, buffer_index, buffer_filled)
 
             return runner_state, metrics
 
         # test metrics not supported yet
         test_metrics = None
+        
+        # buffer
+        buffer = Transition(
+            obs=jnp.zeros((config["NUM_AGENTS"], config["BUFFER_PER_AGENT"], config["NUM_STEPS"], *env.single_observation_space.shape), dtype=jnp.uint8),
+            action=jnp.zeros((config["NUM_AGENTS"], config["BUFFER_PER_AGENT"], config["NUM_STEPS"]), dtype=jnp.int32),
+            reward=jnp.zeros((config["NUM_AGENTS"], config["BUFFER_PER_AGENT"], config["NUM_STEPS"]), dtype=jnp.float32),
+            done=jnp.zeros((config["NUM_AGENTS"], config["BUFFER_PER_AGENT"], config["NUM_STEPS"]), dtype=jnp.bool_),
+            next_obs=jnp.zeros((config["NUM_AGENTS"], config["BUFFER_PER_AGENT"], config["NUM_STEPS"], *env.single_observation_space.shape), dtype=jnp.uint8),
+            q_val=jnp.zeros((config["NUM_AGENTS"], config["BUFFER_PER_AGENT"], config["NUM_STEPS"], env.single_action_space.n), dtype=jnp.float32) #TODO: remove this
+        )
+        
+        buffer_index = jnp.array(0)
+        buffer_filled = jnp.array(0)
 
         # train
         rng, _rng = jax.random.split(rng)
         expl_state = (init_obs, env_state)
-        runner_state = (agent_train_states, expl_state, test_metrics, _rng)
+        
+        runner_state = (agent_train_states, expl_state, test_metrics, _rng, buffer, buffer_index, buffer_filled)
 
         runner_state, metrics = jax.lax.scan(
-            _update_step, runner_state, None, config["NUM_UPDATES"]
+            _update_step, runner_state, jnp.arange(config["NUM_UPDATES"]), config["NUM_UPDATES"]
         )
 
         return {"runner_state": runner_state, "metrics": metrics}
 
     return train
-
+    
 
 def single_run(config):
     config = {**config, **config["alg"]}
@@ -645,6 +827,7 @@ def single_run(config):
     env_name = config["ENV_NAME"]
 
     wandb.init(
+        id=config["RUN_ID"],
         entity=config["ENTITY"],
         project=config["PROJECT"],
         tags=[
@@ -652,7 +835,6 @@ def single_run(config):
             env_name.upper(),
             f"jax_{jax.__version__}",
         ],
-        name=f"{config['ALG_NAME']}_{config['ENV_NAME']}",
         config=config,
         mode=config["WANDB_MODE"],
     )
@@ -671,7 +853,7 @@ def single_run(config):
         from jaxmarl.wrappers.baselines import save_params
 
         model_state = outs["runner_state"][0]
-        save_dir = os.path.join(config["SAVE_PATH"], env_name)
+        save_dir = os.path.join(config["SAVE_PATH"], config["RUN_ID"])
         os.makedirs(save_dir, exist_ok=True)
         OmegaConf.save(
             config,
@@ -686,7 +868,8 @@ def single_run(config):
             save_dir,
             f"{alg_name}_{env_name}_seed{config['SEED']}.safetensors",
         )
-        save_params(params, save_path)
+        batch_stats = model_state.batch_stats
+        save_params({"params": params, "batch_stats": batch_stats}, save_path)
 
 
 def tune(default_config):

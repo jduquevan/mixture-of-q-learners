@@ -1,2 +1,4 @@
 alg:
   MEMMAP_DIR: "/home/mila/a/aghajohm/scratch/mixture-of-qlearners/rb"
+
+SAVE_PATH: "/home/mila/a/aghajohm/scratch/mixture-of-qlearners/checkpoints"

@@ -1,11 +1,14 @@
 ALG_NAME: "di"
 TOTAL_TIMESTEPS: 5e7 # with 4 frame skip correpsnds to 200M frames
 TOTAL_TIMESTEPS_DECAY: 5e7 # will be used for decay functions (epsilon and lr)
-NUM_ENVS: 128 # parallel environments
+NUM_ENVS: 32 # parallel environments
 NUM_STEPS: 32 # steps per environment in each update
 EPS_START: 1.
 EPS_FINISH: 0.001
 EPS_DECAY: 0.1 # ratio of total updates
+EPS_SWITCH_POINT: 1e9 # switch point for second epsilon schedule
+TOTAL_TIMESTEPS_DECAY_2: 5e7 # will be used for decay functions (epsilon and lr)
+
 NUM_EPOCHS: 2 # number of epochs per update
 NUM_MINIBATCHES: 32 # minibatches per epoch
 NORM_TYPE: "layer_norm" # layer_norm or batch_norm
@@ -16,9 +19,15 @@ GAMMA: 0.99
 LAMBDA: 0.65
 NUM_AGENTS: 1
 
+# mixture of q learning params
+BUFFER_PER_AGENT: 512
+MIX_SCHEDULE: "no-mix"
+RESET_SCHEDULE: "no-reset"
+SHARE_STRATEGY: "share-all"
+
 # env specific, see https://envpool.readthedocs.io/en/latest/env/atari.html
 ENV_NAME: "Pong-v5"
-ENV_KWARGS: 
+ENV_KWARGS:
   episodic_life: True # lost life -> done, increases sample efficiency, may hurt in some games
   reward_clip: True # reward into -1, 1
   repeat_action_probability: 0. # sticky actions
