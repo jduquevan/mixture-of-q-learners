@@ -21,7 +21,7 @@
 #SBATCH --gpus=nvidia_h100_80gb_hbm3_3g.40gb:1
 
 # Submit jobs.
-cd /project/rrg-bengioy-ad/jduque/mixture-of-q-learners/purejaxql
+cd /project/rrg-bengioy-ad/jduque/mixture-of-q-learners
 module purge
 module load cuda/12.2
 export HOME=/project/rrg-bengioy-ad/jduque/
