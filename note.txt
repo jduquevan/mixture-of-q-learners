@@ -1,0 +1,58 @@
+# replay buffer (June 22 2025)
+Current replay buffer lives in GPU. One observation is (3, 84, 84) unint8 ~ 20KB. 
+An entry in the buffer encapsulates two observations (time T, time T+1), action, and reward. The observation is the bulky one.
+Each buffer entry is 40KB. Only 25 entry is 1MB and 25K entry is 1 GB. Even 10GB will just fit 250K or 0.25M entries.
+Containing 1M transitions in this way, needs a replay buffer of 40GB. This can be taxing on a GPU though I am not yet sure it cannot be done. 
+If we increase the resolution to even 256x256, it would be (3,256,256) ~ 200KB so we need 10 times more memory: 400 GB which is not usable in a gpu. 
+Therefore, RB should live on HDD and memory mapped. 
+
+How?
+
+We have two RBs. One RB is the Lake. One RB is the Pond.
+Lake lives on HDD. Pond lives on GPU.
+During the independent training the Pond feeds Lake. Lake swells and stores it. Our PQN does not train on Pond content. It feeds the Pond. (Agent -> Trajectories -> Pond -> Lake)
+During the resets, the Lake feeds the Pond and a single agent is trained on the Lake data with high replay ratio. (Lake -> Pond -> Training Agent)
+
+
+Quirks:
+Epsilon schedule should reset at reset points.
+
+
+
+Technical debt in code:
+Options for mixing data among agents should be removed. 
+Second schedule and these things should be removed. It should be handled much cleaner.
+
+What I expect to observe?
+
+I expect to observe swift recovery of evaluation performance after resets. 
+
+
+What would be publication worthy?
+
+A: Single agent trained on 100M frames.
+B: Mixture agent trained on 100M frames where each agent saw 25M frames.
+Mixture beat Single. 
+
+# Algorithm
+Lake: Huge RB lives on HDD.
+Four agents with Four Ponds: Small RB lives on GPU
+While Reaches 100M Frames Total:
+    1-First, each agent trains independently with PQN and pours data in its own Pond
+    2-When Ponds fill up, they fill up the Lake.
+    3-Stop training after 500 steps.
+    4-Fill one BigPond for one BigAgent from the lake uniformly.
+    5-Train BigAgent on BigPond with DQN. BigEpsilonScheduler should be reset (But, should we reset to 1.0?)
+    6-Stop training BigAgent after 100 steps.
+    7-Clone Four Agents from the BigAgent & Reset Their Epsilon Schedulers (But, should we reset to 1.0?)
+
+
+Impelmentation plan:
+What do we have? A code that trains parallel agents on their own ponds using PQN or DQN. 
+However, we need to make that code support:
+1-Breaks in training.
+2-Lake
+3-Flexible Epsilon Scheduler
+
+
+

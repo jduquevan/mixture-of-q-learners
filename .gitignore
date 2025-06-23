@@ -19,5 +19,7 @@ purejaxql/.schemas
 load_env.sh
 pyproject.toml
 uv.lock
+*.mp4
+*.out
 
 
