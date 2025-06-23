@@ -15,9 +15,9 @@
 #SBATCH -N 1 #nodes
 #SBATCH -n 1 #tasks
 #SBATCH --mem=40G
-#SBATCH --time=0-11:59:00
+#SBATCH --time=0-23:59:00
 #SBATCH --gres=gpu:a100l:1
-#SBATCH --partition=long
+#SBATCH --partition=main
 
 # Submit jobs.
 module purge
@@ -38,8 +38,9 @@ CMD="CUDA_VISIBLE_DEVICES=0 python ppomix.py \
     alg.NUM_EPOCHS=${PPO_EPOCHS} \
     alg.LR=${LR} \
     alg.ENT_COEFF=${ENT} \
-    alg.NUM_ENVS=128 \
-    alg.ENV_NAME=Gravitar-v5"
+    alg.NUM_ENVS=32 \
+    alg.NUM_AGENTS=4 \
+    alg.ENV_NAME=Breakout-v5"
 
 # Print the full command for debugging
 stdbuf -o0 echo "Executing command: $CMD"

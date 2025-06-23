@@ -279,20 +279,12 @@ class CriticState(TrainState):
     timesteps: int = 0
     n_updates: int = 0
     grad_steps: int = 0
-    ema_return: jnp.ndarray = 0.0
-    mix_counter: jnp.ndarray = 0
 
 class ActorState(TrainState):
     batch_stats: Any
     timesteps: int = 0
     n_updates: int = 0
     grad_steps: int = 0
-    ema_return: jnp.ndarray = 0.0
-    mix_counter: jnp.ndarray = 0
-
-@jax.jit
-def _update_ema(prev_ema, new_value, alpha):
-    return alpha * new_value + (1 - alpha) * prev_ema
 
 def _policy_from_logits(logits: jax.Array):
     """Return categorical π(a|s), log π(a|s) and entropy H[π]"""
@@ -342,56 +334,55 @@ def compute_agent_metrics(metrics, config):
         metrics,
     )
 
-# def initialize_agents(config, env, rng, network):
-#     num_agents = config.get("NUM_AGENTS", 1)
-#     rngs = jax.random.split(rng, num_agents)
-#     lr_scheduler = optax.linear_schedule(
-#             init_value=config["LR"],
-#             end_value=1e-20,
-#             transition_steps=(config["NUM_UPDATES_DECAY"])
-#             * config["NUM_MINIBATCHES"]
-#             * config["NUM_EPOCHS"],
-#         )
-#     lr = lr_scheduler if config.get("LR_LINEAR_DECAY", False) else config["LR"]
-#     batched_critic_states, batched_actor_states = jax.vmap(lambda r: create_agent(env, network, config, lr, r))(rngs)
-#     return batched_critic_states, batched_actor_states
+def create_agent(env, network, config, lr, rng):
+    init_x = jnp.zeros((1, *env.single_observation_space.shape))
+    variables = network.init(rng, init_x, train=False)
 
-def initialize_agents(config, env, rng, network):
-    num_agents   = config["NUM_AGENTS"]
-    dummy_x      = jnp.zeros((1, *env.single_observation_space.shape))
-    variables    = network.init(rng, dummy_x, train=False)
+    params_critic = flax.core.freeze({
+        **variables['params'],
+        'actor_head': {}
+    })
+    params_actor  = flax.core.freeze({
+        **variables['params'],
+        'critic_head': {}
+    })
 
-    # separate copies of *identical* params / batch_stats
-    base_params, base_stats = variables["params"], variables["batch_stats"]
-
-    lr_sched = optax.linear_schedule(
-        init_value=config["LR"],
-        end_value=1e-20,
-        transition_steps=config["NUM_UPDATES_DECAY"]
-                       * config["NUM_MINIBATCHES"]
-                       * config["NUM_EPOCHS"],
-    ) if config.get("LR_LINEAR_DECAY", False) else config["LR"]
-
-    tx = lambda lr: optax.chain(
-        optax.clip_by_global_norm(config["MAX_GRAD_NORM"]),
-        optax.radam(lr),
+    tx_critic = optax.chain(
+        optax.clip_by_global_norm(config['MAX_GRAD_NORM']),
+        optax.radam(lr)
+    )
+    tx_actor  = optax.chain(
+        optax.clip_by_global_norm(config['MAX_GRAD_NORM']),
+        optax.radam(lr)
     )
 
-    def make_state(_):
-        return CriticState.create(   # critic
-            apply_fn  = network.apply,
-            params    = flax.core.freeze({**base_params, "actor_head": {}}),
-            batch_stats = base_stats,
-            tx        = tx(lr_sched),
-        ), ActorState.create(        # actor
-            apply_fn  = network.apply,
-            params    = flax.core.freeze({**base_params, "critic_head": {}}),
-            batch_stats = base_stats,
-            tx        = tx(lr_sched),
-        )
+    critic_state = CriticState.create(
+        apply_fn  = network.apply,
+        params    = params_critic,
+        batch_stats = variables['batch_stats'],
+        tx        = tx_critic,
+    )
+    actor_state  = ActorState.create(
+        apply_fn  = network.apply,
+        params    = params_actor,
+        batch_stats = variables['batch_stats'],
+        tx        = tx_actor,
+    )
+    return critic_state, actor_state
 
-    critic_states, actor_states = jax.vmap(make_state)(jnp.arange(num_agents))
-    return critic_states, actor_states
+def initialize_agents(config, env, rng, network):
+    num_agents = config.get("NUM_AGENTS", 1)
+    rngs = jax.random.split(rng, num_agents)
+    lr_scheduler = optax.linear_schedule(
+            init_value=config["LR"],
+            end_value=1e-20,
+            transition_steps=(config["NUM_UPDATES_DECAY"])
+            * config["NUM_MINIBATCHES"]
+            * config["NUM_EPOCHS"],
+        )
+    lr = lr_scheduler if config.get("LR_LINEAR_DECAY", False) else config["LR"]
+    batched_critic_states, batched_actor_states = jax.vmap(lambda r: create_agent(env, network, config, lr, r))(rngs)
+    return batched_critic_states, batched_actor_states
 
 def _compute_gae(values, rewards, dones, gamma, lam):
     T, N = rewards.shape
@@ -452,6 +443,18 @@ def make_train(config):
 
     def train(rng):
         original_seed = rng[0]
+        
+        # MULTI-GPU SET-UP
+        n_dev           = jax.local_device_count()
+        agents_per_dev  = config["NUM_AGENTS"] // n_dev
+        assert agents_per_dev * n_dev == config["NUM_AGENTS"], (
+            "NUM_AGENTS must be divisible by #GPUs")
+
+        def slice_agents(x):
+            """Take a pytree with leading axis = NUM_AGENTS and
+            keep only the slice that belongs to this replica."""
+            x = x.reshape((n_dev, agents_per_dev) + x.shape[1:])   # (n_dev, agents_per_dev, …)
+            return jax.lax.index_in_dim(x, jax.lax.axis_index("devices"), keepdims=False)
 
         # INIT NETWORK AND OPTIMIZER
         network = ActorCritic(
@@ -461,7 +464,12 @@ def make_train(config):
         )
 
         rng, _rng = jax.random.split(rng)
+        device_idx = jax.lax.axis_index("devices")
+        rng = jax.random.fold_in(rng, device_idx)
         critic_train_states, actor_train_states = initialize_agents(config, env, rng, network)
+
+        critic_train_states = jax.tree_map(slice_agents, critic_train_states)
+        actor_train_states  = jax.tree_map(slice_agents, actor_train_states)
 
         # TRAINING LOOP
         def _update_step(runner_state, unused):
@@ -480,7 +488,7 @@ def make_train(config):
                         method=ActorCritic.actor)
                 )(
                     actor_train_states,
-                    last_obs.reshape((config["NUM_AGENTS"], envs_per_agent, *last_obs.shape[1:]))
+                    last_obs.reshape((agents_per_dev, envs_per_agent, *last_obs.shape[1:]))
                 )
                 vals = jax.vmap(
                     lambda ts, obs: network.apply(
@@ -490,10 +498,10 @@ def make_train(config):
                         method=ActorCritic.critic)
                 )(
                     critic_train_states,
-                    last_obs.reshape((config["NUM_AGENTS"], envs_per_agent, *last_obs.shape[1:]))
+                    last_obs.reshape((agents_per_dev, envs_per_agent, *last_obs.shape[1:]))
                 )
                 
-                rng_a_batched = jnp.repeat(jnp.expand_dims(rng_a, axis=0), config["NUM_AGENTS"], axis=0)
+                rng_a_batched = jnp.repeat(jnp.expand_dims(rng_a, axis=0), agents_per_dev, axis=0)
                 _rngs = jax.vmap(lambda key: jax.random.split(key, config["NUM_ENVS"] + config["TEST_ENVS"]))(rng_a_batched)
                 new_action = jax.vmap(                                           # ← over agents
                     lambda l_row, k_row: jnp.concatenate(
@@ -505,9 +513,9 @@ def make_train(config):
                 )(logits, _rngs)
 
                 probs, log_ps, _ = _policy_from_logits(logits)
-                log_ps = jnp.take_along_axis(log_ps, new_action[..., None], -1).reshape((config["NUM_AGENTS"]*envs_per_agent, 1))
-                new_action = new_action.reshape((config["NUM_AGENTS"]*envs_per_agent, *new_action.shape[2:]))
-                vals = vals.reshape((config["NUM_AGENTS"]*envs_per_agent, *vals.shape[2:]))
+                log_ps = jnp.take_along_axis(log_ps, new_action[..., None], -1).reshape((agents_per_dev*envs_per_agent, 1))
+                new_action = new_action.reshape((agents_per_dev*envs_per_agent, *new_action.shape[2:]))
+                vals = vals.reshape((agents_per_dev*envs_per_agent, *vals.shape[2:]))
 
                 new_obs, new_env_state, reward, new_done, info = env.step(
                     env_state, new_action
@@ -537,7 +545,7 @@ def make_train(config):
             if config.get("TEST_DURING_TRAINING", False):
                 # remove testing envs
                 def filter_transitions(x, config):
-                    num_agents = config["NUM_AGENTS"]
+                    num_agents = agents_per_dev
                     num_steps = config["NUM_STEPS"]
                     envs_per_agent = num_envs + config["TEST_ENVS"] if config.get("TEST_DURING_TRAINING", False) else num_envs
                     x = jnp.transpose(x, (1, 0) + tuple(range(2, x.ndim)))
@@ -552,14 +560,14 @@ def make_train(config):
 
             critic_train_states = critic_train_states.replace(
                 timesteps=critic_train_states.timesteps
-                + config["NUM_STEPS"] * config["NUM_AGENTS"] 
+                + config["NUM_STEPS"] * agents_per_dev 
             )
             actor_train_states = actor_train_states.replace(
                 timesteps=actor_train_states.timesteps
-                + config["NUM_STEPS"] * config["NUM_AGENTS"] 
+                + config["NUM_STEPS"] * agents_per_dev 
             )
             
-            next_obs = transitions.next_obs.reshape(config["NUM_STEPS"], config["NUM_AGENTS"], config["NUM_ENVS"], *transitions.next_obs.shape[2:])
+            next_obs = transitions.next_obs.reshape(config["NUM_STEPS"], agents_per_dev, config["NUM_ENVS"], *transitions.next_obs.shape[2:])
             next_obs_last = next_obs[-1]
             last_next_value = jax.vmap(                               # over agents
                 lambda cts, obs: network.apply(
@@ -571,7 +579,7 @@ def make_train(config):
                 ).squeeze(-1)
             )(critic_train_states, next_obs_last) 
 
-            values = jnp.concatenate([transitions.val.squeeze(-1),last_next_value.reshape((1, config["NUM_AGENTS"]*config["NUM_ENVS"]))], axis=0)
+            values = jnp.concatenate([transitions.val.squeeze(-1),last_next_value.reshape((1, agents_per_dev*config["NUM_ENVS"]))], axis=0)
 
             gae_advantages, lambda_targets  = _compute_gae(
                 values   = values,                 # (T+1, N)
@@ -581,15 +589,16 @@ def make_train(config):
                 lam      = config["LAMBDA"],
             )
             gae_advantages = (gae_advantages - gae_advantages.mean()) / (gae_advantages.std() + 1e-8)
-            
+            local_cfg = {**config, "NUM_AGENTS": agents_per_dev}
+
             def _learn_epoch(carry, _):
                 critic_train_states, actor_train_states, rng = carry
                 rng, _rng = jax.random.split(rng)
-                minibatches = jax.tree_util.tree_map(lambda x: preprocess_transitions_per_agent(x, _rng, config), transitions)
+                minibatches = jax.tree_util.tree_map(lambda x: preprocess_transitions_per_agent(x, _rng, local_cfg), transitions)
                 minibatches = jax.tree_util.tree_map(lambda x: jnp.swapaxes(x, 0, 1), minibatches)
-                targets = jax.tree_map(lambda x: preprocess_transitions_per_agent(x, _rng, config), lambda_targets)
+                targets = jax.tree_map(lambda x: preprocess_transitions_per_agent(x, _rng, local_cfg), lambda_targets)
                 targets = jax.tree_util.tree_map(lambda x: jnp.swapaxes(x, 0, 1), targets)
-                advantages = jax.tree_map(lambda x: preprocess_transitions_per_agent(x, _rng, config), gae_advantages)
+                advantages = jax.tree_map(lambda x: preprocess_transitions_per_agent(x, _rng, local_cfg), gae_advantages)
                 advantages = jax.tree_util.tree_map(lambda x: jnp.swapaxes(x, 0, 1), advantages)
 
                 def _learn_phase(carry, minibatch_and_target):
@@ -607,6 +616,7 @@ def make_train(config):
                             loss = 0.5 * jnp.mean((pred_val - target) ** 2)
                             return loss, updates["batch_stats"]
                         (critic_loss, new_critic_bs), grads = jax.value_and_grad(_critic_loss_fn, has_aux=True)(cts.params)
+                        # grads = jax.lax.pmean(grads, axis_name="devices")
                         updates, new_opt_state = cts.tx.update(grads, cts.opt_state, cts.params)
                         new_critic_params = optax.apply_updates(cts.params, updates)
                         cts = cts.replace(params=new_critic_params, batch_stats=new_critic_bs, opt_state=new_opt_state, grad_steps=cts.grad_steps+1)
@@ -634,6 +644,7 @@ def make_train(config):
                             return pg_loss + ent_coeff * ent_loss, (updates["batch_stats"], entropy.mean())
 
                         (actor_loss, (new_actor_bs, entropies)), grads = jax.value_and_grad(_actor_loss_fn, has_aux=True)(ats.params)
+                        # grads = jax.lax.pmean(grads, axis_name="devices")
                         updates, new_opt_state = ats.tx.update(grads, ats.opt_state, ats.params)
                         new_actor_params = optax.apply_updates(ats.params, updates)
                         ats = ats.replace(params=new_actor_params, batch_stats=new_actor_bs, opt_state=new_opt_state, grad_steps=ats.grad_steps+1)
@@ -662,111 +673,26 @@ def make_train(config):
             mean_critic_losses = jnp.mean(critic_losses, axis=0)
             mean_actor_losses = jnp.mean(actor_losses, axis=0)
             mean_entropies = jnp.mean(entropies, axis=0)
-            env_metrics = compute_agent_metrics(infos, config)
-
-            ema_target = env_metrics["normalized_returned_episode_returns"] 
-            critic_train_states = critic_train_states.replace(
-                ema_return = _update_ema(critic_train_states.ema_return, ema_target, config["EMA_ALPHA"])
-            )
-            actor_train_states  = actor_train_states.replace(
-                ema_return = critic_train_states.ema_return
-            )
-            critic_train_states = critic_train_states.replace(mix_counter = critic_train_states.mix_counter + 1)
-            actor_train_states  = actor_train_states.replace(mix_counter  = actor_train_states.mix_counter  + 1)
-
-            def _merge_params(stacked_params, weights):
-                """
-                `stacked_params`: PyTree whose leaves are shape (A, …)
-                `weights`       : (A,) normalised, positive
-                returns         : PyTree with agent axis removed via weighted sum
-                """
-                return jax.tree_util.tree_map(
-                    lambda x: jnp.tensordot(weights, x, axes=1),   # (A, …) → (…)
-                    stacked_params,
-                )
-
-            def _repeat_pytree(tree, n):
-                """Return a PyTree whose leaves are stacked copies of t along new axis 0."""
-                return jax.tree_util.tree_map(lambda x: jnp.stack([x] * n, axis=0), tree)
-
-            do_mix = jnp.max(critic_train_states.mix_counter) >= config["MIXING_STEPS"]
-
-            def _mix_states(_):
-                """
-                Merge agents by soft-averaging their parameters, then
-                (1) zero BN running stats and
-                (2) re-initialise optimiser states.
-
-                Returns
-                -------
-                (new_critic_states, new_actor_states)
-                """
-                A   = config["NUM_AGENTS"]
-                tau = config.get("MIX_TAU", 2.0)           # temperature for softmax
-
-                # ---------- weights over agents ----------------------------------------
-                w = jax.nn.softmax(critic_train_states.ema_return / tau)   # shape (A,)
-
-                # ---------- parameter averages -----------------------------------------
-                merged_critic = _merge_params(critic_train_states.params,  w)
-                merged_actor  = _merge_params(actor_train_states.params,   w)
-
-                # ---------- replicate for every agent ----------------------------------
-                critic_pack = _repeat_pytree(merged_critic, A)
-                actor_pack  = _repeat_pytree(merged_actor,  A)
-
-                # ---------- 1) zero batch-norm statistics ------------------------------
-                zero_stats_single = jax.tree_util.tree_map(
-                    lambda x: jnp.zeros_like(x[0]),   # take a single agent’s stats, shape (C,)
-                    critic_train_states.batch_stats,
-                )
-                stats_pack = _repeat_pytree(zero_stats_single, A) 
-
-                # ---------- 2) re-initialise optimiser slots ---------------------------
-                def _reset_opt(ts: TrainState):
-                    return ts.replace(opt_state = ts.tx.init(ts.params))
-
-                new_critic_states = jax.vmap(_reset_opt)(
-                    critic_train_states.replace(
-                        params      = critic_pack,
-                        batch_stats = stats_pack,
-                        mix_counter = jnp.zeros_like(critic_train_states.mix_counter),
-                    )
-                )
-
-                new_actor_states  = jax.vmap(_reset_opt)(
-                    actor_train_states.replace(
-                        params      = actor_pack,
-                        batch_stats = stats_pack,
-                        mix_counter = jnp.zeros_like(actor_train_states.mix_counter),
-                    )
-                )
-
-                return new_critic_states, new_actor_states
-
-            def _skip_states(_):
-                return critic_train_states, actor_train_states
-
-            critic_train_states, actor_train_states = jax.lax.cond(
-                do_mix, _mix_states, _skip_states, operand=None
-            )
-
+            env_metrics = compute_agent_metrics(infos, local_cfg)
             metrics = {}
-            for i in range(config["NUM_AGENTS"]):
-                metrics[f"agent_{i}/env_step"] = critic_train_states.timesteps[i]
-                metrics[f"agent_{i}/update_steps"] = critic_train_states.n_updates[i]
-                metrics[f"agent_{i}/env_frame"] = critic_train_states.timesteps[i] * env.single_observation_space.shape[0]
-                metrics[f"agent_{i}/grad_steps"] = critic_train_states.grad_steps[i]
-                metrics[f"agent_{i}/td_loss"] = mean_critic_losses[i]
-                metrics[f"agent_{i}/policy_loss"] = mean_actor_losses[i]
-                metrics[f"agent_{i}/entropy"] = mean_entropies[i]
-                
+
+            agent_offset = device_idx * agents_per_dev
+            for local_i in range(agents_per_dev):
+                g = agent_offset + local_i          # global agent id
+                metrics[f"agent_{g}/env_step"]      = critic_train_states.timesteps[local_i]
+                metrics[f"agent_{g}/update_steps"]  = critic_train_states.n_updates[local_i]
+                metrics[f"agent_{g}/env_frame"]     = critic_train_states.timesteps[local_i] \
+                                                        * env.single_observation_space.shape[0]
+                metrics[f"agent_{g}/grad_steps"]    = critic_train_states.grad_steps[local_i]
+                metrics[f"agent_{g}/td_loss"]       = mean_critic_losses[local_i]
+                metrics[f"agent_{g}/policy_loss"]   = mean_actor_losses[local_i]
+                metrics[f"agent_{g}/entropy"]       = mean_entropies[local_i]
+            
                 for k, v in env_metrics.items():
-                    metrics[f"agent_{i}/{k}"] = v[i]
+                    metrics[f"agent_{g}/{k}"] = v[local_i]
             
             # report on wandb if required
             if config["WANDB_MODE"] != "disabled":
-
                 def callback(metrics, original_seed):
                     if config.get("WANDB_LOG_ALL_SEEDS", False):
                         metrics.update(
@@ -775,7 +701,8 @@ def make_train(config):
                                 for k, v in metrics.items()
                             }
                         )
-                    wandb.log(metrics, step=metrics["agent_0/update_steps"])
+                    first_key = f"agent_{agent_offset}/update_steps"
+                    wandb.log(metrics, step=int(metrics[first_key]))
 
                 jax.debug.callback(callback, metrics, original_seed)
 
@@ -788,6 +715,8 @@ def make_train(config):
 
         # train
         rng, _rng = jax.random.split(rng)
+        init_obs  = slice_agents(init_obs)     # keeps agents_per_dev × envs_per_agent
+        env_state = slice_agents(env_state)
         expl_state = (init_obs, env_state)
         runner_state = (critic_train_states, actor_train_states, expl_state, test_metrics, _rng)
 
@@ -825,7 +754,9 @@ def single_run(config):
     if config["NUM_SEEDS"] > 1:
         raise NotImplementedError("Vmapped seeds not supported yet.")
     else:
-        outs = jax.jit(make_train(config))(rng)
+        outs = jax.pmap(make_train(config), axis_name="devices")(
+            jax.random.split(rng, jax.local_device_count())
+        )
     print(f"Took {time.time() - t0} seconds to complete.")
 
     # save params
@@ -870,11 +801,13 @@ def tune(default_config):
         print("running experiment with params:", config)
 
         rng = jax.random.PRNGKey(config["SEED"])
+        n_devices = jax.local_device_count()
 
         if config["NUM_SEEDS"] > 1:
             raise NotImplementedError("Vmapped seeds not supported yet.")
         else:
-            outs = jax.jit(make_train(config))(rng)
+            rngs = jax.random.split(rng, jax.local_device_count())
+            outs = jax.pmap(make_train(config), axis_name="devices")(rngs)
 
     sweep_config = {
         "name": f"pqn_atari_{default_config['ENV_NAME']}",
