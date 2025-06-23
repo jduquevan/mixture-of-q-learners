@@ -28,7 +28,7 @@ export HOME=/project/rrg-bengioy-ad/jduque/
 export HYDRA_FULL_ERROR=1
 export WANDB_MODE=offline
 export WANDB_DIR=/project/rrg-bengioy-ad/jduque/wandb
-source .venv/bin/activate
+source /project/rrg-bengioy-ad/jduque/.venv/bin/activate
 
 # Define all arguments
 SEED=${1}
