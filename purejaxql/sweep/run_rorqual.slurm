@@ -28,7 +28,7 @@ export HOME=/project/rrg-bengioy-ad/jduque/
 export HYDRA_FULL_ERROR=1
 export WANDB_MODE=offline
 export WANDB_DIR=/project/rrg-bengioy-ad/jduque/wandb
-source /project/rrg-bengioy-ad/jduque/.venv/bin/activate
+source /project/rrg-bengioy-ad/jduque/mixture-of-q-learners/.venv/bin/activate
 
 # Define all arguments
 SEED=${1}
@@ -37,7 +37,7 @@ LR=${3}
 ENT=${4}
 
 # Construct the full command
-CMD="CUDA_VISIBLE_DEVICES=0 python/project/rrg-bengioy-ad/jduque/mixture-of-q-learners/purejaxql/ppomix.py \
+CMD="CUDA_VISIBLE_DEVICES=0 python ppomix.py \
     SEED=${SEED} \
     alg.NUM_EPOCHS=${PPO_EPOCHS} \
     alg.LR=${LR} \
