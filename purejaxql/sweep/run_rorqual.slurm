@@ -37,7 +37,7 @@ LR=${3}
 ENT=${4}
 
 # Construct the full command
-CMD="CUDA_VISIBLE_DEVICES=0 python ppomix.py \
+CMD="CUDA_VISIBLE_DEVICES=0 python  /project/rrg-bengioy-ad/jduque/mixture-of-q-learners/purejaxql/ppomix.py \
     SEED=${SEED} \
     alg.NUM_EPOCHS=${PPO_EPOCHS} \
     alg.LR=${LR} \
