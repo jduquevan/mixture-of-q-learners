@@ -1,11 +1,11 @@
-#!/bin/bashAdd commentMore actions
+#!/bin/bash
 
 ##############################
 #       Job blueprint        #
 ##############################
 
 # Give your job a name, so you can recognize it in the queue overview
-#SBATCH --job-name=meltingpot
+#SBATCH --job-name=ppomix
 
 # Remove one # to uncommment
 #SBATCH --output=/project/rrg-bengioy-ad/jduque/slurm_output/slurm-%j.out
