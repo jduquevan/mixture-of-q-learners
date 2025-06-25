@@ -821,11 +821,14 @@ def make_train(config):
     
 
 def single_run(config):
+    # --- config ---
     config = {**config, **config["alg"]}
+    assert config["NUM_SEEDS"] == 1, "Vmapped seeds not supported yet."
 
     alg_name = config.get("ALG_NAME", "pqn")
     env_name = config["ENV_NAME"]
 
+    # --- wandb ---
     wandb.init(
         id=config["RUN_ID"],
         entity=config["ENTITY"],
@@ -839,16 +842,11 @@ def single_run(config):
         mode=config["WANDB_MODE"],
     )
 
-    rng = jax.random.PRNGKey(config["SEED"])
+    # --- train ---
+    rng = jax.random.PRNGKey(config["SEED"])    
+    outs = jax.jit(make_train(config))(rng)
 
-    t0 = time.time()
-    if config["NUM_SEEDS"] > 1:
-        raise NotImplementedError("Vmapped seeds not supported yet.")
-    else:
-        outs = jax.jit(make_train(config))(rng)
-    print(f"Took {time.time() - t0} seconds to complete.")
-
-    # save params
+    # --- save params ---
     if config.get("SAVE_PATH", None) is not None:
         from jaxmarl.wrappers.baselines import save_params
 
@@ -862,7 +860,6 @@ def single_run(config):
             ),
         )
 
-        # assumes not vmpapped seeds
         params = model_state.params
         save_path = os.path.join(
             save_dir,
@@ -871,56 +868,12 @@ def single_run(config):
         batch_stats = model_state.batch_stats
         save_params({"params": params, "batch_stats": batch_stats}, save_path)
 
-
-def tune(default_config):
-    """Hyperparameter sweep with wandb."""
-
-    default_config = {
-        **default_config,
-        **default_config["alg"],
-    }  # merge the alg config with the main config
-
-    def wrapped_make_train():
-        wandb.init(project=default_config["PROJECT"])
-
-        # update the default params
-        config = copy.deepcopy(default_config)
-        for k, v in dict(wandb.config).items():
-            config["alg"][k] = v
-
-        print("running experiment with params:", config)
-
-        rng = jax.random.PRNGKey(config["SEED"])
-
-        if config["NUM_SEEDS"] > 1:
-            raise NotImplementedError("Vmapped seeds not supported yet.")
-        else:
-            outs = jax.jit(make_train(config))(rng)
-
-    sweep_config = {
-        "name": f"pqn_atari_{default_config['ENV_NAME']}",
-        "method": "bayes",
-        "metric": {
-            "name": "test_returns",
-            "goal": "maximize",
-        },
-        "parameters": {
-            "LR": {"values": [0.0005, 0.0001, 0.00005]},
-            "LAMBDA": {"values": [0.3, 0.6, 0.9]},
-        },
-    }
-
-    wandb.login()
-    sweep_id = wandb.sweep(
-        sweep_config, entity=default_config["ENTITY"], project=default_config["PROJECT"]
-    )
-    wandb.agent(sweep_id, wrapped_make_train, count=1000)
-
-
 @hydra.main(version_base=None, config_path="./config", config_name="config")
 def main(config):
     config = OmegaConf.to_container(config)
-    print(config)
+    print("Config:\n", OmegaConf.to_yaml(config))
+    
+       
     if config["DEBUG"]:
         jax.config.update("jax_disable_jit", True)
         import debugpy
@@ -928,12 +881,9 @@ def main(config):
         print("Waiting for client to attach...")
         debugpy.wait_for_client()
         print("Client attached")
-    print("Config:\n", OmegaConf.to_yaml(config))
     
-    if config["HYP_TUNE"]:
-        tune(config)
-    else:
-        single_run(config)
+    
+    single_run(config)
 
 
 if __name__ == "__main__":
