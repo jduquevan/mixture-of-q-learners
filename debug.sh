@@ -11,10 +11,7 @@ python purejaxql/mq_atari.py \
     alg.NUM_AGENTS=1 \
     alg.NUM_ENVS=32 \
     alg.BUFFER_PER_AGENT=128 \
-    alg.SHARE_STRATEGY=no-share \
     alg.TOTAL_TIMESTEPS_DECAY=50000000.0 \
     alg.TOTAL_TIMESTEPS=50000.0 \
-    alg.RESET_SCHEDULE=no-reset \
-    alg.MIX_SCHEDULE=no-mix \
     +alg.ENV_KWARGS.img_width=84 \
     +alg.ENV_KWARGS.img_height=84

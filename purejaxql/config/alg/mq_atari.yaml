@@ -19,9 +19,6 @@ NUM_AGENTS: 1
 
 # mixture of q learning params
 BUFFER_PER_AGENT: 512
-MIX_SCHEDULE: "no-mix"
-RESET_SCHEDULE: "no-reset"
-SHARE_STRATEGY: "share-all"
 
 # env specific, see https://envpool.readthedocs.io/en/latest/env/atari.html
 ENV_NAME: "Pong-v5"
