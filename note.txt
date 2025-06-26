@@ -57,7 +57,10 @@ However, we need to make that code support:
 
 Implementation log:
 First, create debug.sh that runs the script in debug mode.
+Well, I am wondering where to put the make_train. Should I just make that handle the whole training?
+ or should I change the nature of the train function so it just trains for a portion?
 
+ First, make sure that our wandb uses also step.
 
 
 
@@ -65,6 +68,19 @@ First, create debug.sh that runs the script in debug mode.
 # Questions that pop up in my head during the Implementation
 1-#Frames gravitar is now trained on in PQN, Rainbow
 2-Curves look flat at the end, hyperparameter issue?
+
+
+
+# June 26th 2025
+Found out that the replay buffer is larger than I thought. 
+Therefore, the plan is to transfer the transitions from the four agents live to a single agent.
+It should happen in a jitted loop where some interactions of the large agent also get involved. 
+Also, we should separate out the step for the four agents and the single agent thingy. If this works, what was wrong with the mix idea then. 
+In the mix idea, four agents would mix transitions with each other for a period of time. 
+The wrong thing might be not training a single agent from scratch. It is hard to make them go into different routes. 
+The fact is training independent agents with a smaller batch size hurts performance. Therefore, we cannot afford to make batch sizes very small. 
+
+
 
 
 
