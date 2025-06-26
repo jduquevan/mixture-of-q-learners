@@ -1,6 +1,6 @@
 source /home/mila/a/aghajohm/repos/mixture-of-q-learners/load_env.sh
 
-python purejaxql/di_atari.py \
+python purejaxql/mq_atari.py \
     RUN_ID=test \
     DEBUG=True \
     WANDB_MODE=disabled \

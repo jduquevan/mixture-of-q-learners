@@ -56,8 +56,15 @@ However, we need to make that code support:
 
 
 Implementation log:
-First, know how to run.
+First, create debug.sh that runs the script in debug mode.
 
+
+
+
+
+# Questions that pop up in my head during the Implementation
+1-#Frames gravitar is now trained on in PQN, Rainbow
+2-Curves look flat at the end, hyperparameter issue?
 
 
 
