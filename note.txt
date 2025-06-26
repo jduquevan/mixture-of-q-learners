@@ -81,6 +81,10 @@ The wrong thing might be not training a single agent from scratch. It is hard to
 The fact is training independent agents with a smaller batch size hurts performance. Therefore, we cannot afford to make batch sizes very small. 
 
 
+# implementation plan
+1-make training the mixture produce lots of checkpoints along the way.
+
+
 
 
 

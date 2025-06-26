@@ -292,24 +292,6 @@ def preprocess_transitions_per_agent(x, rng, config):
     rngs = jax.random.split(rng, num_agents)
     return jax.vmap(lambda x_agent, r: preprocess_agent_transition(x_agent, r, config), in_axes=(0, 0))(x, rngs)
 
-def mix_transitions(x, config, final_indices):
-    # x: (num_steps, total_envs, ...), with total_envs = NUM_AGENTS * NUM_ENVS.
-    num_steps = x.shape[0]
-    num_agents = config["NUM_AGENTS"]
-    num_envs = x.shape[1] // num_agents
-    # First, transpose to (total_envs, num_steps, ...)
-    x = jnp.transpose(x, (1, 0) + tuple(range(2, x.ndim)))
-    # Then, reshape total_envs into (num_agents, num_envs)
-    x = x.reshape((num_agents, num_envs, num_steps) + x.shape[2:])
-    # mix envs with final_indices
-    x = x[final_indices[0], final_indices[1], ...]
-    # Finally, transpose to (num_steps, num_agents, num_envs, ...)
-    x = jnp.transpose(x, (2, 0, 1) + tuple(range(3, x.ndim)))
-    # now get back to (num_steps, total_envs, ...)
-    x = x.reshape((num_steps, num_agents*num_envs) + x.shape[3:])
-    # return the mixed transitions
-    return x
-
 def update_buffer(buf, x, index, config):
     num_steps = x.shape[0]
     num_agents = config["NUM_AGENTS"]
@@ -453,7 +435,7 @@ def orchestrate_mq_train(config):
         jitted_train = jax.jit(lambda rng: train(config, env, obs, env_state, agent_train_states, network, eps_scheduler, buffer, buffer_index, buffer_filled, rng))
         outs = jitted_train(step_rng)
         runner_state = outs['runner_state']
-        (agent_train_states, (obs, env_state), test_metrics, __ditch_rng, buffer, buffer_index, buffer_filled) = runner_state
+        (agent_train_states, (obs, env_state), test_metrics, _rng, buffer, buffer_index, buffer_filled) = runner_state
         print(f"buffer_index: {buffer_index}, buffer_filled: {buffer_filled}")
         
         
