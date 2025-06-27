@@ -20,5 +20,8 @@ WANDB_TAGS: ['test',]
 alg:
   WANDB_LOG_ALL_SEEDS: False # will log all the vmapped seeds separetely
 
+# checkpoint configs
+MIX_CHECKPOINT_EVERY: 100
+
 # where to save the params (if None, will not save)
-SAVE_PATH: "./models"
+SAVE_PATH: "./experiments"

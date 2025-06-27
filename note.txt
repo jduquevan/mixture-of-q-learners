@@ -83,8 +83,9 @@ The fact is training independent agents with a smaller batch size hurts performa
 
 # implementation plan
 1-make training the mixture produce lots of checkpoints along the way.
-
-
-
+Does current training code for the mixture support random exits out of the function and continuations?
+I think one part that is broken is the epsilon scheduler. The epsilon scheduler depeneds on the update_step and that gets reset each time. 
+In order to fix this, it should depend on the mx_updates. That is the thing that should be fed to the epsilon scheduler. 
+The epsilon scheduler itself should implement the iterative nature of jumping to 1.0 and back to 0.0 again.
 
 
