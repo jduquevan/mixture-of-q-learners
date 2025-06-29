@@ -333,12 +333,12 @@ def eps_greedy_exploration(rng, q_vals, eps):
     )
     return chosed_actions
 
-def create_agent(env, network, config, lr, rng):
+def create_agent(env, network, lr, rng, MAX_GRAD_NORM):
     init_x = jnp.zeros((1, *env.single_observation_space.shape))
     network_variables = network.init(rng, init_x, train=False)
 
     tx = optax.chain(
-        optax.clip_by_global_norm(config["MAX_GRAD_NORM"]),
+        optax.clip_by_global_norm(MAX_GRAD_NORM),
         optax.radam(learning_rate=lr),
     )
 
@@ -355,18 +355,26 @@ def create_agent(env, network, config, lr, rng):
     )
     return train_state
 
-def initialize_agents(config, env, rng, network):
-    num_agents = config.get("NUM_AGENTS", 1)
-    rngs = jax.random.split(rng, num_agents)
+def initialize_agents(env, 
+                      rng, 
+                      network,
+                      NUM_AGENTS,
+                      LR,
+                      LR_LINEAR_DECAY,
+                      NUM_UPDATES_DECAY,
+                      NUM_MINIBATCHES,
+                      NUM_EPOCHS,
+                      MAX_GRAD_NORM):
+    rngs = jax.random.split(rng, NUM_AGENTS)
     lr_scheduler = optax.linear_schedule(
-            init_value=config["LR"],
+            init_value=LR,
             end_value=1e-20,
-            transition_steps=(config["mix"]["NUM_UPDATES_DECAY"])
-            * config["NUM_MINIBATCHES"]
-            * config["NUM_EPOCHS"],
+            transition_steps=(NUM_UPDATES_DECAY)
+            * NUM_MINIBATCHES
+            * NUM_EPOCHS,
         )
-    lr = lr_scheduler if config.get("LR_LINEAR_DECAY", False) else config["LR"]
-    batched_train_states = jax.vmap(lambda r: create_agent(env, network, config, lr, r))(rngs)
+    lr = lr_scheduler if LR_LINEAR_DECAY else LR
+    batched_train_states = jax.vmap(lambda r: create_agent(env, network, lr, r, MAX_GRAD_NORM))(rngs)
     return batched_train_states, lr
 
 def _compute_targets(last_q, q_vals, reward, done, GAMMA, LAMBDA):
@@ -442,30 +450,42 @@ def save_mix_checkpoint(config, model_state, step):
     params = model_state.params
     batch_stats = model_state.batch_stats
     save_params({"params": params, "batch_stats": batch_stats}, os.path.join(save_mix_dir, f'step_{step}.safetensors'))
+    
+def save_big_checkpoint(config, model_state, step):
+    from jaxmarl.wrappers.baselines import save_params
+    save_big_dir = os.path.join(config["SAVE_PATH"], config["RUN_ID"], 'big_checkpoints')
+    os.makedirs(save_big_dir, exist_ok=True)
+    params = model_state.params
+    batch_stats = model_state.batch_stats
+    save_params({"params": params, "batch_stats": batch_stats}, os.path.join(save_big_dir, f'step_{step}.safetensors'))
 
 def orchestrate_mq_train(config):
+    # ---- assert ----
+    # check the save every is divisible by the number of updates, or the checkpoints will not be saved.
+    # assert config["mix"]["NUM_UPDATES"] % config["mix"]["SAVE_CHECKPOINT_EVERY"] == 0
+    # assert config["big"]["mid_rounds"]["NUM_UPDATES"] % config["big"]["SAVE_CHECKPOINT_EVERY"] == 0
+    # assert config["big"]["final_round"]["NUM_UPDATES"] % config["big"]["SAVE_CHECKPOINT_EVERY"] == 0
     save_config(config)
     
     rng = jax.random.PRNGKey(config["SEED"])
-    initialization_rng = rax.fold_in(rng, 0)
-    env, obs, env_state, eps_scheduler, network, agent_train_states, config, buffer, buffer_index, buffer_filled, lr_function = initialize_mix(config, initialization_rng)
-    
-    train_rng = rax.fold_in(rng, 1)
-    
+    initialization_mix_rng, initialization_big_rng, train_rng = jax.random.split(rng, 3)
+    env, obs, env_state, mix_eps_scheduler, network, mix_agent_train_states, config, mix_buffer, mix_buffer_index, mix_buffer_filled, mix_lr_function = initialize_mix(config, initialization_mix_rng)
+    big_agent_train_states, big_lr_function, big_eps_scheduler_mid_rounds, big_eps_scheduler_final_round, big_buffer, big_buffer_index, big_buffer_filled = initialize_big_agent(config, env, initialization_big_rng, network) 
+        
     for i in range(config["mq"]["rounds"]):
         print(f"MQ Round {i} ------------------------------")
         
         # train the mix
         step_rng = rax.fold_in(train_rng, i)
-        jitted_train_mix = jax.jit(lambda rng: train(env,
+        jitted_train_mix = jax.jit(lambda rng: train(env, #TODO: make them not use the buffer
                                                  obs,
                                                  env_state,
-                                                 agent_train_states, 
+                                                 mix_agent_train_states, 
                                                  network,
-                                                 eps_scheduler,
-                                                 buffer,
-                                                 buffer_index,
-                                                 buffer_filled,
+                                                 mix_eps_scheduler,
+                                                 mix_buffer,
+                                                 mix_buffer_index,
+                                                 mix_buffer_filled,
                                                  config["mix"]["BUFFER_PER_AGENT"],
                                                  config["NUM_STEPS"],
                                                  config["mix"]["NUM_AGENTS"],
@@ -479,20 +499,78 @@ def orchestrate_mq_train(config):
                                                  config["REW_SCALE"],
                                                  config["GAMMA"],
                                                  config["LAMBDA"],
-                                                 lr_function,
-                                                 rng))
+                                                 mix_lr_function, 
+                                                 rng,
+                                                 log_prefix='mix'))
         outs = jitted_train_mix(step_rng)
         
         runner_state = outs['runner_state']
-        (agent_train_states, (obs, env_state), test_metrics, _rng, buffer, buffer_index, buffer_filled) = runner_state
-        print(f"buffer_index: {buffer_index}, buffer_filled: {buffer_filled}")
+        (agent_train_states, (obs, env_state), mix_test_metrics, _rng, mix_buffer, mix_buffer_index, mix_buffer_filled) = runner_state
+        print(f"buffer_index: {mix_buffer_index}, buffer_filled: {mix_buffer_filled}")
         
-        mx_updates = agent_train_states.n_updates[0]
-        if mx_updates % config["mix"]["SAVE_CHECKPOINT_EVERY"] == 0:
-            print(f"Saving checkpoint at step {mx_updates}")
-            save_mix_checkpoint(config, agent_train_states, mx_updates)
+        mix_updates = agent_train_states.n_updates[0]
+        if mix_updates % config["mix"]["SAVE_CHECKPOINT_EVERY"] == 0:
+            print(f"Saving checkpoint at step {mix_updates}")
+            save_mix_checkpoint(config, agent_train_states, mix_updates)
             
-        # train big agent
+        # ---- train big agent ----
+        # gather transitions from the mix
+        big_train_rng = rax.fold_in(step_rng, 1)
+        print(f"before filling big buffer, big_buffer_index: {big_buffer_index}, big_buffer_filled: {big_buffer_filled}")
+        jitted_fill_big_buffer = jax.jit(lambda rng:fill_big_agent_buffer_from_mix(config,
+                                                                                         env,
+                                                                                         network,
+                                                                                         big_eps_scheduler_mid_rounds,
+                                                                                         rng,
+                                                                                         mix_agent_train_states,
+                                                                                         obs,
+                                                                                         env_state,
+                                                                                         big_buffer,
+                                                                                         big_buffer_index,
+                                                                                         big_buffer_filled))
+        big_buffer, big_buffer_index, big_buffer_filled, (obs, env_state) = jitted_fill_big_buffer(big_train_rng)
+        print(f"after filling big buffer, big_buffer_index: {big_buffer_index}, big_buffer_filled: {big_buffer_filled}")
+        # train the big agent on transitions
+        big_train_rng = rax.fold_in(step_rng, 2)
+        jitted_train_big = jax.jit(lambda rng: train(env,
+                                                     obs,
+                                                     env_state,
+                                                     big_agent_train_states,
+                                                     network,
+                                                     big_eps_scheduler_mid_rounds,
+                                                     big_buffer,
+                                                     big_buffer_index,
+                                                     big_buffer_filled,
+                                                     config["big"]["BUFFER_SIZE"],
+                                                     config["NUM_STEPS"],
+                                                     1, # num agents, we have 1 big agent
+                                                     config["NUM_ENVS"] * config["mix"]["NUM_AGENTS"], #TODO: should I separate the big agent env from the mix envs?
+                                                     config["TEST_ENVS"] * config["mix"]["NUM_AGENTS"], #TODO: should I separate the big agent env from the mix envs?
+                                                     config["big"]["mid_rounds"]["NUM_UPDATES"],
+                                                     config["NUM_EPOCHS"],
+                                                     config["NUM_MINIBATCHES"],
+                                                     config.get("TEST_DURING_TRAINING", False),
+                                                     config["WANDB_MODE"],
+                                                     config["REW_SCALE"],
+                                                     config["GAMMA"],
+                                                     config["LAMBDA"],
+                                                     big_lr_function,
+                                                     rng,
+                                                     log_prefix='big'))
+        outs = jitted_train_big(big_train_rng)
+        runner_state = outs['runner_state']
+        (big_agent_train_states, (obs, env_state), big_test_metrics, _rng, big_buffer, big_buffer_index, big_buffer_filled) = runner_state
+        print(f"after training big agent, buffer_index: {big_buffer_index}, buffer_filled: {big_buffer_filled}")
+        big_updates = big_agent_train_states.n_updates[0]
+        if big_updates % config["big"]["SAVE_CHECKPOINT_EVERY"] == 0:
+            print(f"Saving checkpoint at step {big_updates}")
+            save_big_checkpoint(config, big_agent_train_states, big_updates)
+        
+        print(f"big_buffer_index: {big_buffer_index}, big_buffer_filled: {big_buffer_filled}")
+        
+        
+
+        
         
     return outs
 
@@ -524,16 +602,20 @@ def initialize_mix(config, rng):
     init_obs, env_state = env.reset()
     
 
-    eps_scheduler = optax.linear_schedule(config["EPS_START"], 
-                                          config["EPS_FINISH"],
-                                         (config["mix"]["NUM_UPDATES_DECAY"]))
+    eps_scheduler = optax.linear_schedule(config["EPS_START"], config["EPS_FINISH"], (config["mix"]["NUM_UPDATES_DECAY"]))
     # INIT NETWORK AND OPTIMIZER
-    network = QNetwork(action_dim=env.single_action_space.n,
-        norm_type=config["NORM_TYPE"],
-        norm_input=config.get("NORM_INPUT", False),
-    )
+    network = QNetwork(action_dim=env.single_action_space.n, norm_type=config["NORM_TYPE"], norm_input=config.get("NORM_INPUT", False))
 
-    agent_train_states, lr_function = initialize_agents(config, env, rng, network)
+    agent_train_states, lr_function = initialize_agents(env,
+                                                        rng,
+                                                        network,
+                                                        config["mix"]["NUM_AGENTS"],
+                                                        config["LR"],
+                                                        config["LR_LINEAR_DECAY"],
+                                                        config["mix"]["NUM_UPDATES_DECAY"],
+                                                        config["NUM_MINIBATCHES"],
+                                                        config["NUM_EPOCHS"],
+                                                        config["MAX_GRAD_NORM"])
     
     B = config["mix"]["BUFFER_PER_AGENT"]
     S = config["NUM_STEPS"]
@@ -552,6 +634,132 @@ def initialize_mix(config, rng):
     buffer_filled = jnp.array(0)
     
     return env, init_obs, env_state, eps_scheduler, network, agent_train_states, config, buffer, buffer_index, buffer_filled, lr_function
+
+def initialize_big_agent(config, env, rng, network):
+    
+    eps_scheduler_mid_rounds = optax.linear_schedule(config["EPS_START"], config["EPS_FINISH"], (config["big"]["mid_rounds"]["NUM_UPDATES_DECAY"]))
+    eps_scheduler_final_round = optax.linear_schedule(config["EPS_START"], config["EPS_FINISH"], (config["big"]["final_round"]["NUM_UPDATES_DECAY"]))
+    agent_train_states, lr_function = initialize_agents(env, 
+                                                        rng,
+                                                        network,
+                                                        1,
+                                                        config["LR"],
+                                                        config["LR_LINEAR_DECAY"],
+                                                        config["big"]["mid_rounds"]["NUM_UPDATES_DECAY"], #TODO: remove the lr decay in general, but this one just works for mid rounds.
+                                                        config["NUM_MINIBATCHES"],
+                                                        config["NUM_EPOCHS"],
+                                                        config["MAX_GRAD_NORM"])
+
+    B = config["big"]["BUFFER_SIZE"]
+    S = config["NUM_STEPS"]
+    A = 1
+     # buffer
+    buffer = Transition(
+        obs=jnp.zeros((A, B, S, *env.single_observation_space.shape), dtype=jnp.uint8),
+        action=jnp.zeros((A, B, S), dtype=jnp.int32),
+        reward=jnp.zeros((A, B, S), dtype=jnp.float32),
+        done=jnp.zeros((A, B, S), dtype=jnp.bool_),
+        next_obs=jnp.zeros((A, B, S, *env.single_observation_space.shape), dtype=jnp.uint8),
+        q_val=jnp.zeros((A, B, S, env.single_action_space.n), dtype=jnp.float32) #TODO: remove this
+    )
+    buffer_index = jnp.array(0)
+    buffer_filled = jnp.array(0)
+    
+    return agent_train_states, lr_function, eps_scheduler_mid_rounds, eps_scheduler_final_round, buffer, buffer_index, buffer_filled
+
+def fill_big_agent_buffer_from_mix(config,
+                             env,
+                             network,
+                             eps_scheduler, #TODO: should we use the eps scheduler or just a constant?
+                             rng,
+                             agent_train_states,
+                             obs,
+                             env_state,
+                             buffer,
+                             buffer_index,
+                             buffer_filled):
+    NUM_ENVS = config["NUM_ENVS"]
+    TEST_ENVS = config["TEST_ENVS"]
+    NUM_AGENTS = config["mix"]["NUM_AGENTS"]
+    NUM_STEPS = config["NUM_STEPS"]
+    TEST_DURING_TRAINING = config["TEST_DURING_TRAINING"]
+    REW_SCALE = config["REW_SCALE"]
+    
+    expl_state = (obs, env_state)
+   # ---- generate trajectories from the mix ----  
+    envs_per_agent = NUM_ENVS + TEST_ENVS if TEST_DURING_TRAINING else NUM_ENVS
+    # SAMPLE PHASE
+    def _step_env(carry, _):
+        last_obs, env_state, rng = carry
+        rng, rng_a, rng_s = jax.random.split(rng, 3)
+        q_vals = jax.vmap(
+            lambda ts, obs: network.apply({"params": ts.params, "batch_stats": ts.batch_stats}, obs, train=False)
+        )(agent_train_states, last_obs.reshape((NUM_AGENTS, envs_per_agent, *last_obs.shape[1:])))
+
+        def get_eps_per_agent(n_updates):
+            eps = eps_scheduler(n_updates)
+            eps_train = jnp.full((NUM_ENVS,), eps)
+            eps_test = jnp.zeros((TEST_ENVS,))
+            return jnp.concatenate([eps_train, eps_test], axis=0)
+        
+        # different eps for each env
+        eps_values = jax.vmap(get_eps_per_agent)(agent_train_states.n_updates)
+        rng_a_batched = jnp.repeat(jnp.expand_dims(rng_a, axis=0), NUM_AGENTS, axis=0)
+        _rngs = jax.vmap(lambda key: jax.random.split(key, NUM_ENVS + TEST_ENVS))(rng_a_batched)
+        new_action = jax.vmap(lambda rngs, q, eps: jax.vmap(eps_greedy_exploration)(rngs, q, eps))(_rngs, q_vals, eps_values)
+        new_action = new_action.reshape((NUM_AGENTS*envs_per_agent, *new_action.shape[2:]))
+        q_vals = q_vals.reshape((NUM_AGENTS*envs_per_agent, *q_vals.shape[2:]))
+
+        new_obs, new_env_state, reward, new_done, info = env.step(
+            env_state, new_action
+        )
+
+        transition = Transition(
+            obs=last_obs,
+            action=new_action,
+            reward=REW_SCALE * reward,
+            done=new_done,
+            next_obs=new_obs,
+            q_val=q_vals,
+        )
+        return (new_obs, new_env_state, rng), (transition, info)
+
+    # step the env
+    rng, _rng = jax.random.split(rng)
+    (*expl_state, rng), (transitions, infos) = jax.lax.scan(
+        _step_env,
+        (*expl_state, _rng),
+        None,
+        NUM_STEPS,
+    )
+    expl_state = tuple(expl_state)
+    
+    if TEST_DURING_TRAINING: # remove the testing envs from the transitions
+        def filter_and_return_train(x):
+            num_agents = NUM_AGENTS
+            num_steps = NUM_STEPS
+            envs_per_agent = NUM_ENVS + TEST_ENVS if TEST_DURING_TRAINING else NUM_ENVS
+            x = jnp.transpose(x, (1, 0) + tuple(range(2, x.ndim)))
+            x = x.reshape((num_agents, envs_per_agent, num_steps) + x.shape[2:])
+            x = x[:, : -TEST_ENVS] # the only difference from the filter_and_return_test is this line and the next one (as the number of envs is different)
+            x = x.reshape((num_agents*NUM_ENVS, num_steps) + x.shape[3:])
+            return jnp.transpose(x, (1, 0) + tuple(range(2, x.ndim)))
+        
+        
+        infos = jax.tree_map(lambda x: filter_and_return_train(x), infos)
+        transitions = jax.tree.map(lambda x: filter_and_return_train(x), transitions)
+        
+        
+    # --- update the buffer ---
+    num_envs = transitions.obs.shape[1]
+    buffer = jax.tree.map(lambda x, y: update_buffer(x, y, buffer_index, 1), buffer, transitions) #TODO: check if this is working as expected, this is 1 because big agent is a buffer of 1.
+    buffer_index += num_envs
+    buffer_index = buffer_index % config["big"]["BUFFER_SIZE"]
+    buffer_filled = jnp.minimum(buffer_filled+num_envs, config["big"]["BUFFER_SIZE"])
+    
+    return buffer, buffer_index, buffer_filled, expl_state
+    
+    
     
 
 def train(
@@ -578,7 +786,8 @@ def train(
         GAMMA,
         LAMBDA,
         lr_function,
-        rng):
+        rng,
+        log_prefix=''):
     original_seed = rng[0]
 
     # params_copy
@@ -762,21 +971,21 @@ def train(
         # --- logging with dirty hacks ---
         for i in range(NUM_AGENTS):
             eps_val = eps_scheduler(agent_train_states.n_updates[i])
-            metrics[f"mix_agent_{i}/env_step"] = agent_train_states.timesteps[i]
-            metrics[f"mix_agent_{i}/update_steps"] = agent_train_states.n_updates[i]
-            metrics[f"mix_agent_{i}/env_frame"] = agent_train_states.timesteps[i] * env.single_observation_space.shape[0]
-            metrics[f"mix_agent_{i}/grad_steps"] = agent_train_states.grad_steps[i]
-            metrics[f"mix_agent_{i}/td_loss"] = losses[i]
-            metrics[f"mix_agent_{i}/epsilon"] = eps_val #TODO: add lr scheduler
-            metrics[f"mix_agent_{i}/buffer_filled"] = buffer_filled
-            metrics[f"mix_agent_{i}/buffer_index"] = buffer_index
+            metrics[f"{log_prefix}_agent_{i}/env_step"] = agent_train_states.timesteps[i]
+            metrics[f"{log_prefix}_agent_{i}/update_steps"] = agent_train_states.n_updates[i]
+            metrics[f"{log_prefix}_agent_{i}/env_frame"] = agent_train_states.timesteps[i] * env.single_observation_space.shape[0]
+            metrics[f"{log_prefix}_agent_{i}/grad_steps"] = agent_train_states.grad_steps[i]
+            metrics[f"{log_prefix}_agent_{i}/td_loss"] = losses[i]
+            metrics[f"{log_prefix}_agent_{i}/epsilon"] = eps_val #TODO: add lr scheduler
+            metrics[f"{log_prefix}_agent_{i}/buffer_filled"] = buffer_filled
+            metrics[f"{log_prefix}_agent_{i}/buffer_index"] = buffer_index
             
-            metrics[f"mix_agent_{i}/lr"] = lr_function(agent_train_states.n_updates[i]) if callable(lr_function) else lr_function #FIXME: Is this actually n_updates that I should use here?
+            metrics[f"{log_prefix}_agent_{i}/lr"] = lr_function(agent_train_states.n_updates[i]) if callable(lr_function) else lr_function #FIXME: Is this actually n_updates that I should use here?
             
             for k, v in env_train_metrics.items():
-                metrics[f"mix_agent_{i}/train_{k}"] = v[i]
+                metrics[f"{log_prefix}_agent_{i}/train_{k}"] = v[i]
             for k, v in env_test_metrics.items():
-                metrics[f"mix_agent_{i}/test_{k}"] = v[i]
+                metrics[f"{log_prefix}_agent_{i}/test_{k}"] = v[i]
         
         # report on wandb if required
         if WANDB_MODE != "disabled":
