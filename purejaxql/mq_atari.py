@@ -458,7 +458,7 @@ def save_big_checkpoint(config, model_state, step):
     params = model_state.params
     batch_stats = model_state.batch_stats
     save_params({"params": params, "batch_stats": batch_stats}, os.path.join(save_big_dir, f'step_{step}.safetensors'))
-
+    
 def orchestrate_mq_train(config):
     # ---- assert ----
     # check the save every is divisible by the number of updates, or the checkpoints will not be saved.
@@ -474,99 +474,100 @@ def orchestrate_mq_train(config):
         
     for i in range(config["mq"]["rounds"]):
         print(f"MQ Round {i} ------------------------------")
+        # ---- define functions ----
+        def train_mix_fn(train_states, rng, obs, env_state, mix_buffer, mix_buffer_index, mix_buffer_filled):
+            return train(env, obs, env_state, train_states, network, mix_eps_scheduler, mix_buffer, mix_buffer_index, mix_buffer_filled,
+                         config["mix"]["BUFFER_PER_AGENT"], config["NUM_STEPS"], config["mix"]["NUM_AGENTS"], config["NUM_ENVS"], config["TEST_ENVS"],
+                         config["mix"]["NUM_UPDATES"], config["NUM_EPOCHS"], config["NUM_MINIBATCHES"],config.get("TEST_DURING_TRAINING", False), 
+                         config["WANDB_MODE"], config["REW_SCALE"], config["GAMMA"], config["LAMBDA"], mix_lr_function, rng, log_prefix='mix')
+            
+        def fill_big_buffer_fn(train_states, rng, obs, env_state, big_buffer, big_buffer_index, big_buffer_filled):
+            return fill_big_agent_buffer_from_mix(config, env, network, big_eps_scheduler_mid_rounds, rng, train_states, obs, env_state,
+                                                  big_buffer, big_buffer_index, big_buffer_filled)
+            
+        def train_big_fn(train_states, rng, obs, env_state, big_buffer, big_buffer_index, big_buffer_filled):
+            n_updates = 1
+            return train(env, obs, env_state, train_states, network, big_eps_scheduler_mid_rounds,
+                         big_buffer, big_buffer_index, big_buffer_filled, config["big"]["BUFFER_SIZE"], config["NUM_STEPS"],
+                         1, config["NUM_ENVS"] * config["mix"]["NUM_AGENTS"], config["TEST_ENVS"] * config["mix"]["NUM_AGENTS"],
+                         n_updates, config["NUM_EPOCHS"], config["NUM_MINIBATCHES"],
+                         config.get("TEST_DURING_TRAINING", False), config["WANDB_MODE"], config["REW_SCALE"], config["GAMMA"],
+                         config["LAMBDA"], big_lr_function, rng, log_prefix='big')
+            
+        def train_mix_big_fn(big_agent_train_states, mix_agent_train_states, rng, obs, env_state, big_buffer, big_buffer_index, big_buffer_filled):
+            def fn(carry, _):
+                big_agent_train_states, (obs, env_state), rng, big_buffer, big_buffer_index, big_buffer_filled = carry
+                
+                # ---- fill the big buffer ----
+                print(f"before filling big buffer, big_buffer_index: {big_buffer_index}, big_buffer_filled: {big_buffer_filled}")
+                
+                big_fill_rng = rax.fold_in(rng, 1)        
+                big_buffer, big_buffer_index, big_buffer_filled, (obs, env_state) = fill_big_buffer_fn(mix_agent_train_states, big_fill_rng, obs, env_state, big_buffer, big_buffer_index, big_buffer_filled)
+                
+                print(f"after filling big buffer, big_buffer_index: {big_buffer_index}, big_buffer_filled: {big_buffer_filled}")
+                
+                
+                # ---- train the big agent on transitions ----
+                big_train_rng = rax.fold_in(rng, 2)
+                outs = train_big_fn(big_agent_train_states, big_train_rng, obs, env_state, big_buffer, big_buffer_index, big_buffer_filled)
+                runner_state = outs['runner_state']
+                (big_agent_train_states, (obs, env_state), big_test_metrics, rng, big_buffer, big_buffer_index, big_buffer_filled) = runner_state
+                
+                return (big_agent_train_states, (obs, env_state), rng, big_buffer, big_buffer_index, big_buffer_filled), {'big_test_metrics': big_test_metrics}
+            
+            (big_agent_train_states, (obs, env_state), _rng, big_buffer, big_buffer_index, big_buffer_filled), big_test_metrics = jax.lax.scan(
+                fn, (big_agent_train_states, (obs, env_state), rng, big_buffer, big_buffer_index, big_buffer_filled), (), config["big"]["mid_rounds"]["NUM_UPDATES"])
         
-        # train the mix
+            return big_agent_train_states, (obs, env_state), big_test_metrics, _rng, big_buffer, big_buffer_index, big_buffer_filled
+            
+            
+        jitted_train_mix = jax.jit(train_mix_fn)
+        jitted_fill_big_buffer = jax.jit(fill_big_buffer_fn)
+        jitted_train_big = jax.jit(train_big_fn)
+        
+        # ---- train the mix ----
         step_rng = rax.fold_in(train_rng, i)
-        jitted_train_mix = jax.jit(lambda rng: train(env, #TODO: make them not use the buffer
-                                                 obs,
-                                                 env_state,
-                                                 mix_agent_train_states, 
-                                                 network,
-                                                 mix_eps_scheduler,
-                                                 mix_buffer,
-                                                 mix_buffer_index,
-                                                 mix_buffer_filled,
-                                                 config["mix"]["BUFFER_PER_AGENT"],
-                                                 config["NUM_STEPS"],
-                                                 config["mix"]["NUM_AGENTS"],
-                                                 config["NUM_ENVS"],
-                                                 config["TEST_ENVS"],
-                                                 config["mix"]["NUM_UPDATES"],
-                                                 config["NUM_EPOCHS"],
-                                                 config["NUM_MINIBATCHES"],
-                                                 config.get("TEST_DURING_TRAINING", False),
-                                                 config["WANDB_MODE"],
-                                                 config["REW_SCALE"],
-                                                 config["GAMMA"],
-                                                 config["LAMBDA"],
-                                                 mix_lr_function, 
-                                                 rng,
-                                                 log_prefix='mix'))
-        outs = jitted_train_mix(step_rng)
-        
+        outs = jitted_train_mix(mix_agent_train_states, step_rng, obs, env_state, mix_buffer, mix_buffer_index, mix_buffer_filled)
         runner_state = outs['runner_state']
-        (agent_train_states, (obs, env_state), mix_test_metrics, _rng, mix_buffer, mix_buffer_index, mix_buffer_filled) = runner_state
+        (mix_agent_train_states, (obs, env_state), mix_test_metrics, _rng, mix_buffer, mix_buffer_index, mix_buffer_filled) = runner_state
+        
         print(f"buffer_index: {mix_buffer_index}, buffer_filled: {mix_buffer_filled}")
         
-        mix_updates = agent_train_states.n_updates[0]
+        # ---- save the mix agent checkpoint ----
+        mix_updates = mix_agent_train_states.n_updates[0]
+        print(f"mix_updates: {mix_updates}")
         if mix_updates % config["mix"]["SAVE_CHECKPOINT_EVERY"] == 0:
             print(f"Saving checkpoint at step {mix_updates}")
-            save_mix_checkpoint(config, agent_train_states, mix_updates)
+            save_mix_checkpoint(config, mix_agent_train_states, mix_updates)
+        
+        for _ in range(config["big"]["mid_rounds"]["NUM_UPDATES"]):
+            # ---- fill the big buffer ----
+            print(f"before filling big buffer, big_buffer_index: {big_buffer_index}, big_buffer_filled: {big_buffer_filled}")
             
-        # ---- train big agent ----
-        # gather transitions from the mix
-        big_train_rng = rax.fold_in(step_rng, 1)
-        print(f"before filling big buffer, big_buffer_index: {big_buffer_index}, big_buffer_filled: {big_buffer_filled}")
-        jitted_fill_big_buffer = jax.jit(lambda rng:fill_big_agent_buffer_from_mix(config,
-                                                                                         env,
-                                                                                         network,
-                                                                                         big_eps_scheduler_mid_rounds,
-                                                                                         rng,
-                                                                                         mix_agent_train_states,
-                                                                                         obs,
-                                                                                         env_state,
-                                                                                         big_buffer,
-                                                                                         big_buffer_index,
-                                                                                         big_buffer_filled))
-        big_buffer, big_buffer_index, big_buffer_filled, (obs, env_state) = jitted_fill_big_buffer(big_train_rng)
-        print(f"after filling big buffer, big_buffer_index: {big_buffer_index}, big_buffer_filled: {big_buffer_filled}")
-        # train the big agent on transitions
-        big_train_rng = rax.fold_in(step_rng, 2)
-        jitted_train_big = jax.jit(lambda rng: train(env,
-                                                     obs,
-                                                     env_state,
-                                                     big_agent_train_states,
-                                                     network,
-                                                     big_eps_scheduler_mid_rounds,
-                                                     big_buffer,
-                                                     big_buffer_index,
-                                                     big_buffer_filled,
-                                                     config["big"]["BUFFER_SIZE"],
-                                                     config["NUM_STEPS"],
-                                                     1, # num agents, we have 1 big agent
-                                                     config["NUM_ENVS"] * config["mix"]["NUM_AGENTS"], #TODO: should I separate the big agent env from the mix envs?
-                                                     config["TEST_ENVS"] * config["mix"]["NUM_AGENTS"], #TODO: should I separate the big agent env from the mix envs?
-                                                     config["big"]["mid_rounds"]["NUM_UPDATES"],
-                                                     config["NUM_EPOCHS"],
-                                                     config["NUM_MINIBATCHES"],
-                                                     config.get("TEST_DURING_TRAINING", False),
-                                                     config["WANDB_MODE"],
-                                                     config["REW_SCALE"],
-                                                     config["GAMMA"],
-                                                     config["LAMBDA"],
-                                                     big_lr_function,
-                                                     rng,
-                                                     log_prefix='big'))
-        outs = jitted_train_big(big_train_rng)
-        runner_state = outs['runner_state']
-        (big_agent_train_states, (obs, env_state), big_test_metrics, _rng, big_buffer, big_buffer_index, big_buffer_filled) = runner_state
-        print(f"after training big agent, buffer_index: {big_buffer_index}, buffer_filled: {big_buffer_filled}")
+            big_fill_rng = rax.fold_in(step_rng, 1)        
+            big_buffer, big_buffer_index, big_buffer_filled, (obs, env_state) = jitted_fill_big_buffer(mix_agent_train_states, big_fill_rng, obs, env_state, big_buffer, big_buffer_index, big_buffer_filled)
+            
+            print(f"after filling big buffer, big_buffer_index: {big_buffer_index}, big_buffer_filled: {big_buffer_filled}")
+            
+            
+            # ---- train the big agent on transitions ----
+            big_train_rng = rax.fold_in(step_rng, 2)
+            outs = jitted_train_big(big_agent_train_states, big_train_rng, obs, env_state, big_buffer, big_buffer_index, big_buffer_filled)
+            runner_state = outs['runner_state']
+            (big_agent_train_states, (obs, env_state), big_test_metrics, _rng, big_buffer, big_buffer_index, big_buffer_filled) = runner_state
+            
+        # ---- save the big agent checkpoint ----
         big_updates = big_agent_train_states.n_updates[0]
         if big_updates % config["big"]["SAVE_CHECKPOINT_EVERY"] == 0:
             print(f"Saving checkpoint at step {big_updates}")
             save_big_checkpoint(config, big_agent_train_states, big_updates)
-        
-        print(f"big_buffer_index: {big_buffer_index}, big_buffer_filled: {big_buffer_filled}")
+        print(f"big_updates: {big_updates}")
+    
+        print(f"after training big agent, buffer_index: {big_buffer_index}, buffer_filled: {big_buffer_filled}")
+            
+        # ---- now, clone the big agent weights to all the mix agents ----
+        # TODO: implement this
+
         
         
 
