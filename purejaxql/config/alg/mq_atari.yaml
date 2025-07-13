@@ -29,11 +29,18 @@ mix:
 # big training
 big:
   mid_rounds:
+    fill:
+      NUM_ENVS: 4
+      NUM_TEST_ENVS: 2
     NUM_UPDATES: 100
     NUM_UPDATES_DECAY: 50
+    NUM_ENVS: 64
+    NUM_TEST_ENVS: 8
   final_round:
     NUM_UPDATES: 5000
     NUM_UPDATES_DECAY: 5000
+    NUM_ENVS: 128
+    NUM_TEST_ENVS: 16
   BUFFER_SIZE: 512
   SAVE_CHECKPOINT_EVERY: 100 # should be divisible by NUM_UPDATES
     

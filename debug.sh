@@ -20,3 +20,9 @@ python purejaxql/mq_atari.py \
     alg.mq.rounds=3 \
     alg.big.final_round.NUM_UPDATES=50 \
     alg.big.final_round.NUM_UPDATES_DECAY=10 \
+    alg.big.mid_rounds.fill.NUM_ENVS=4 \
+    alg.big.mid_rounds.fill.NUM_TEST_ENVS=2 \
+    alg.big.mid_rounds.NUM_ENVS=64 \
+    alg.big.mid_rounds.NUM_TEST_ENVS=8 \
+    alg.big.final_round.NUM_ENVS=128 \
+    alg.big.final_round.NUM_TEST_ENVS=16 \
