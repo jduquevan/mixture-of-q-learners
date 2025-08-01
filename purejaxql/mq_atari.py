@@ -477,11 +477,11 @@ def orchestrate_mq_train(config):
     big_agent_train_states, big_lr_function, big_eps_scheduler_mid_rounds_init, big_buffer, big_buffer_index, big_buffer_filled, big_eps_scheduler_final_round_init = initialize_big_agent(config, big_mid_env, initialization_big_rng, network) 
 
     # change schedulers to allow for iteration
-    def mix_eps_scheduler(step):
-        return mix_eps_scheduler_init(step % config["mix"]["NUM_UPDATES"])
+    def mix_eps_scheduler(step, _rng):
+        return mix_eps_scheduler_init(step % config["mix"]["NUM_UPDATES"], _rng)
     
-    def big_eps_scheduler_mid_rounds(step):
-        return big_eps_scheduler_mid_rounds_init(step % config["big"]["mid_rounds"]["NUM_UPDATES"])
+    def big_eps_scheduler_mid_rounds(step, _rng):
+        return big_eps_scheduler_mid_rounds_init(step % config["big"]["mid_rounds"]["NUM_UPDATES"], _rng)
     
     mix_updates, big_updates = mix_agent_train_states.n_updates[0], big_agent_train_states.n_updates[0]
     assert mix_updates == 0 and big_updates == 0
@@ -496,7 +496,7 @@ def orchestrate_mq_train(config):
             return train(mix_env, obs, env_state, train_states, network, mix_eps_scheduler, mix_buffer, mix_buffer_index, mix_buffer_filled,
                          config["mix"]["BUFFER_PER_AGENT"], config["NUM_STEPS"], config["mix"]["NUM_AGENTS"], config["NUM_ENVS"], config["TEST_ENVS"],
                          config["mix"]["NUM_UPDATES"], config["NUM_EPOCHS"], config["NUM_MINIBATCHES"],config.get("TEST_DURING_TRAINING", False), 
-                         config["WANDB_MODE"], config["REW_SCALE"], config["GAMMA"], config["LAMBDA"], mix_lr_function, rng, log_prefix='mix')
+                         config["WANDB_MODE"], config["REW_SCALE"], config["GAMMA"], config["LAMBDA"], mix_lr_function, rng, config["NUM_ENVS"], log_prefix='mix')
             
         def fill_big_buffer_fn(train_states, rng, obs, env_state, big_buffer, big_buffer_index, big_buffer_filled):
             return fill_big_agent_buffer_from_mix(config, fill_env, network, big_eps_scheduler_mid_rounds, rng, train_states, obs, env_state,
@@ -509,7 +509,7 @@ def orchestrate_mq_train(config):
                          1, config["big"]["mid_rounds"]["NUM_ENVS"], config["big"]["mid_rounds"]["NUM_TEST_ENVS"],
                          n_updates, config["NUM_EPOCHS"], config["NUM_MINIBATCHES"],
                          config.get("TEST_DURING_TRAINING", False), config["WANDB_MODE"], config["REW_SCALE"], config["GAMMA"],
-                         config["LAMBDA"], big_lr_function, rng, log_prefix='big')
+                         config["LAMBDA"], big_lr_function, rng, config["big"]["mid_rounds"]["NUM_ENVS_TO_TRAIN_BIG_AGENT"], log_prefix='big')
             
         def train_mix_big_fn(big_agent_train_states, mix_agent_train_states, rng, fill_obs, fill_env_state, big_mid_obs, big_mid_env_state, big_buffer, big_buffer_index, big_buffer_filled):
             def debug_before_fill(buffer_index, buffer_filled):
@@ -523,12 +523,15 @@ def orchestrate_mq_train(config):
                 
                 # ---- fill the big buffer ----
                 
-                jax.debug.callback(debug_before_fill, big_buffer_index, big_buffer_filled)
+                if config["VERBOSE"]:
+                    jax.debug.callback(debug_before_fill, big_buffer_index, big_buffer_filled)
                 
-                big_fill_rng = rax.fold_in(rng, 1)        
-                big_buffer, big_buffer_index, big_buffer_filled, (fill_obs, fill_env_state) = fill_big_buffer_fn(mix_agent_train_states, big_fill_rng, fill_obs, fill_env_state, big_buffer, big_buffer_index, big_buffer_filled)
+                big_fill_rng = rax.fold_in(rng, 1)
+                if not config["big"]["mid_rounds"]["DONT_FILL_BUFFER"]:    
+                    big_buffer, big_buffer_index, big_buffer_filled, (fill_obs, fill_env_state) = fill_big_buffer_fn(mix_agent_train_states, big_fill_rng, fill_obs, fill_env_state, big_buffer, big_buffer_index, big_buffer_filled)
                 
-                jax.debug.callback(debug_after_fill, big_buffer_index, big_buffer_filled)
+                if config["VERBOSE"]:
+                    jax.debug.callback(debug_after_fill, big_buffer_index, big_buffer_filled)
                 
 
                 # ---- train the big agent on transitions ----
@@ -552,7 +555,7 @@ def orchestrate_mq_train(config):
                          1, config["big"]["final_round"]["NUM_ENVS"], config["big"]["final_round"]["NUM_TEST_ENVS"],
                          config["big"]["final_round"]["NUM_UPDATES"], config["NUM_EPOCHS"], config["NUM_MINIBATCHES"],
                          config.get("TEST_DURING_TRAINING", False), config["WANDB_MODE"], config["REW_SCALE"], config["GAMMA"],
-                         config["LAMBDA"], big_lr_function, rng, log_prefix='big')
+                         config["LAMBDA"], big_lr_function, rng, config["big"]["final_round"]["NUM_ENVS"], log_prefix='big')
             runner_state = outs['runner_state']
             (big_agent_train_states, (big_final_obs, big_final_env_state), big_test_metrics, _rng, big_buffer, big_buffer_index, big_buffer_filled) = runner_state
             return big_agent_train_states, (big_final_obs, big_final_env_state), big_test_metrics, _rng, big_buffer, big_buffer_index, big_buffer_filled
@@ -673,6 +676,13 @@ def initialize_big_final_env(config):
 
 def initialize_mix(config, rng, env):
     eps_scheduler = optax.linear_schedule(config["EPS_START"], config["EPS_FINISH"], (config["mix"]["NUM_UPDATES_DECAY"]))
+    def scheduler_decorator(eps_scheduler):
+        def fn(n_updates, _rng):
+            return eps_scheduler(n_updates)
+        return fn
+    # we decorate our schedulers all to accept rngs, so the interface is the same for all schedulers (for the explortion epsilon scheduler)
+    eps_scheduler = scheduler_decorator(eps_scheduler)
+    
     # INIT NETWORK AND OPTIMIZER
     network = QNetwork(action_dim=env.single_action_space.n, norm_type=config["NORM_TYPE"], norm_input=config.get("NORM_INPUT", False))
 
@@ -709,6 +719,29 @@ def initialize_big_agent(config, env, rng, network):
     
     eps_scheduler_mid_rounds = optax.linear_schedule(config["EPS_START"], config["EPS_FINISH"], (config["big"]["mid_rounds"]["NUM_UPDATES_DECAY"]))
     eps_scheduler_final_round = optax.linear_schedule(config["EPS_START"], config["EPS_FINISH"], (config["big"]["final_round"]["NUM_UPDATES_DECAY"]))
+    
+    def scheduler_decorator(eps_scheduler):
+            def fn(n_updates, _rng):
+                return eps_scheduler(n_updates)
+            return fn
+        
+    if config["big"]["mid_rounds"]["EXPLORATION_EPS_SCHEDULER"] == "depth_exploration_0.1_U0.3":
+        def get_exploration_eps(eps_scheduler):
+            def fn(n_updates, _rng):
+                coin_toss = jax.random.bernoulli(_rng, 0.1)
+                original_eps = eps_scheduler(n_updates)
+                exploration_eps = jax.random.uniform(_rng, (), minval=0, maxval=0.3)
+                return jnp.where(coin_toss, exploration_eps, original_eps)
+            return fn
+        eps_scheduler_mid_rounds = get_exploration_eps(eps_scheduler_mid_rounds)
+    elif config["big"]["mid_rounds"]["EXPLORATION_EPS_SCHEDULER"] == "disabled":
+        # change so it accepts an rng and the interface is the same as the one above
+        eps_scheduler_mid_rounds = scheduler_decorator(eps_scheduler_mid_rounds)
+    else:
+        raise ValueError(f"Invalid exploration epsilon scheduler: {config['big']['mid_rounds']['EXPLORATION_EPS_SCHEDULER']}")
+        
+    eps_scheduler_final_round = scheduler_decorator(eps_scheduler_final_round)
+            
     agent_train_states, lr_function = initialize_agents(env, 
                                                         rng,
                                                         network,
@@ -761,20 +794,21 @@ def fill_big_agent_buffer_from_mix(config,
     # SAMPLE PHASE
     def _step_env(carry, _):
         last_obs, env_state, rng = carry
-        rng, rng_a, rng_s = jax.random.split(rng, 3)
+        rng, rng_a, rng_b = jax.random.split(rng, 3)
         q_vals = jax.vmap(
             lambda ts, obs: network.apply({"params": ts.params, "batch_stats": ts.batch_stats}, obs, train=False)
         )(agent_train_states, last_obs.reshape((NUM_AGENTS, envs_per_agent, *last_obs.shape[1:])))
 
-        def get_eps_per_agent(n_updates):
-            eps = eps_scheduler(n_updates)
-            eps_train = jnp.full((NUM_ENVS,), eps)
-            eps_test = jnp.zeros((TEST_ENVS,))
-            return jnp.concatenate([eps_train, eps_test], axis=0)
+        def get_eps_per_agent(n_updates, _rngs):
+            eps = jax.vmap(lambda _rng: eps_scheduler(n_updates, _rng))(_rngs)
+            eps = eps.at[NUM_ENVS:].set(0) # the rest are the test envs which require zero epsilon 
+            return eps
         
         # different eps for each env
-        eps_values = jax.vmap(get_eps_per_agent)(agent_train_states.n_updates)
-        rng_a_batched = jnp.repeat(jnp.expand_dims(rng_a, axis=0), NUM_AGENTS, axis=0)
+        rng_b_batched = rax.split(rng_b, NUM_AGENTS)
+        _rngs_b = jax.vmap(lambda key: jax.random.split(key, NUM_ENVS + TEST_ENVS))(rng_b_batched)
+        eps_values = jax.vmap(get_eps_per_agent)(agent_train_states.n_updates, _rngs_b)
+        rng_a_batched = rax.split(rng_a, NUM_AGENTS)
         _rngs = jax.vmap(lambda key: jax.random.split(key, NUM_ENVS + TEST_ENVS))(rng_a_batched)
         new_action = jax.vmap(lambda rngs, q, eps: jax.vmap(eps_greedy_exploration)(rngs, q, eps))(_rngs, q_vals, eps_values)
         new_action = new_action.reshape((NUM_AGENTS*envs_per_agent, *new_action.shape[2:]))
@@ -857,7 +891,9 @@ def train(
         LAMBDA,
         lr_function,
         rng,
+        NUM_ENVS_SAMPLED_FROM_BUFFER_PER_AGENT_FOR_TRAINING,
         log_prefix='',
+        VERBOSE=True,
         ): 
     original_seed = rng[0]
 
@@ -870,22 +906,25 @@ def train(
         envs_per_agent = NUM_ENVS + TEST_ENVS if TEST_DURING_TRAINING else NUM_ENVS
         agent_train_states, expl_state, test_metrics, rng, buffer, buffer_index, buffer_filled = runner_state
         # SAMPLE PHASE
+        rng, eps_rng = jax.random.split(rng, 2)
+        rng_eps_batched = rax.split(eps_rng, NUM_AGENTS)
+        _rngs_eps = jax.vmap(lambda key: jax.random.split(key, NUM_ENVS + TEST_ENVS))(rng_eps_batched)
+        
         def _step_env(carry, _):
             last_obs, env_state, rng = carry
-            rng, rng_a, rng_s = jax.random.split(rng, 3)
+            rng, rng_a, rng_b = jax.random.split(rng, 3)
             q_vals = jax.vmap(
                 lambda ts, obs: network.apply({"params": ts.params, "batch_stats": ts.batch_stats}, obs, train=False)
             )(agent_train_states, last_obs.reshape((NUM_AGENTS, envs_per_agent, *last_obs.shape[1:])))
 
-            def get_eps_per_agent(n_updates):
-                eps = eps_scheduler(n_updates)
-                eps_train = jnp.full((NUM_ENVS,), eps)
-                eps_test = jnp.zeros((TEST_ENVS,))
-                return jnp.concatenate([eps_train, eps_test], axis=0)
-            
+            def get_eps_per_agent(n_updates, _rngs):
+                eps = jax.vmap(lambda _rng: eps_scheduler(n_updates, _rng))(_rngs)
+                eps = eps.at[NUM_ENVS:].set(0) # the rest are the test envs which require zero epsilon 
+                return eps
+             
             # different eps for each env
-            eps_values = jax.vmap(get_eps_per_agent)(agent_train_states.n_updates)
-            rng_a_batched = jnp.repeat(jnp.expand_dims(rng_a, axis=0), NUM_AGENTS, axis=0)
+            eps_values = jax.vmap(get_eps_per_agent)(agent_train_states.n_updates, _rngs_eps)
+            rng_a_batched = rax.split(rng_a, NUM_AGENTS)
             _rngs = jax.vmap(lambda key: jax.random.split(key, NUM_ENVS + TEST_ENVS))(rng_a_batched)
             new_action = jax.vmap(lambda rngs, q, eps: jax.vmap(eps_greedy_exploration)(rngs, q, eps))(_rngs, q_vals, eps_values)
             new_action = new_action.reshape((NUM_AGENTS*envs_per_agent, *new_action.shape[2:]))
@@ -945,7 +984,7 @@ def train(
             
             
         # update the buffer
-        num_envs_per_agent = transitions.obs.shape[1] // NUM_AGENTS
+        num_envs_per_agent = NUM_ENVS_SAMPLED_FROM_BUFFER_PER_AGENT_FOR_TRAINING
         buffer = jax.tree.map(lambda x, y: update_buffer(x, y, buffer_index, NUM_AGENTS), buffer, transitions)
         buffer_index += num_envs_per_agent
         buffer_index = buffer_index % BUFFER_PER_AGENT
@@ -1041,7 +1080,7 @@ def train(
         metrics = {}
         # --- logging with dirty hacks ---
         for i in range(NUM_AGENTS):
-            eps_val = eps_scheduler(agent_train_states.n_updates[i])
+            eps_val = eps_scheduler(agent_train_states.n_updates[i], rng) # just pass some rng, we will get a distribution in plots =) 
             metrics[f"{log_prefix}_agent_{i}/env_step"] = agent_train_states.timesteps[i]
             metrics[f"{log_prefix}_agent_{i}/update_steps"] = agent_train_states.n_updates[i]
             metrics[f"{log_prefix}_agent_{i}/env_frame"] = agent_train_states.timesteps[i] * env.single_observation_space.shape[0]
@@ -1068,7 +1107,8 @@ def train(
 
             def callback(metrics):
                 step = metrics[f"{log_prefix}_agent_0/update_steps"]
-                print(f"Logging metrics at step {step} to wandb.")
+                if VERBOSE:
+                    print(f"Logging metrics at step {step} to wandb.")
                 wandb.log(metrics)
 
             jax.debug.callback(callback, metrics)
@@ -1117,6 +1157,7 @@ def single_run(config):
         ],
         config=config,
         mode=config["WANDB_MODE"],
+        settings={"init_timeout":3600},
     )
     
     wandb.define_metric(name='big_agent_0/*', step_metric='big_step')

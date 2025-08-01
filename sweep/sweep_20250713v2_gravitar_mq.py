@@ -1,6 +1,6 @@
 from sweep_utils import submit_slurm_job, get_compute_command
 ### Jobs ###
-BASE_RUN_ID = "20250713_v1_separate_envs"
+BASE_RUN_ID = "20250713_v2_larger_batch"
 BASE_PYTHON_COMMAND = "python purejaxql/mq_atari.py" \
             " RUN_ID={run_id}" \
             " WANDB_TAGS={wandb_tags}" \
@@ -65,58 +65,45 @@ def get_gravitar_job(mix_num_agents: int,
 
 def get_jobs():
     jobs = {
-        'gravitar_mq_debug': get_gravitar_job(mix_num_agents=4,
-                                              num_envs=32,
-                                              buffer_per_agent=32,
+        'gravitar_mq_longer_mixtrain': get_gravitar_job(mix_num_agents=2,
+                                              num_envs=64,
+                                              buffer_per_agent=64,
                                               img_size=128,
-                                              mix_num_updates=10,
-                                              mix_num_updates_decay=10,
-                                              big_mid_rounds_num_updates=10, 
-                                              big_mid_rounds_num_updates_decay=10, 
-                                              mq_rounds=5, 
-                                              big_final_round_num_updates=50,
-                                              big_buffer_size=256,
-                                              big_final_round_num_updates_decay=1),
-        
-        
-        'gravitar_mq_longer_mixtrain': get_gravitar_job(mix_num_agents=4,
-                                              num_envs=32,
-                                              buffer_per_agent=32,
-                                              img_size=128,
-                                              mix_num_updates=8000,
-                                              mix_num_updates_decay=800,
-                                              big_mid_rounds_num_updates=2000, 
-                                              big_mid_rounds_num_updates_decay=200, 
+                                              mix_num_updates=15000,
+                                              mix_num_updates_decay=1500,
+                                              big_mid_rounds_num_updates=5000, 
+                                              big_mid_rounds_num_updates_decay=500, 
                                               mq_rounds=1, 
-                                              big_final_round_num_updates=5000,
+                                              big_final_round_num_updates=20000,
                                               big_buffer_size=256,
                                               big_final_round_num_updates_decay=1),
+        
         
         'gravitar_mq_longer_mixtrain_evgeni': get_gravitar_job(mix_num_agents=1,
                                               num_envs=128,
                                               buffer_per_agent=128,
                                               img_size=128,
-                                              mix_num_updates=8000,
-                                              mix_num_updates_decay=800,
-                                              big_mid_rounds_num_updates=2000, 
-                                              big_mid_rounds_num_updates_decay=200, 
+                                              mix_num_updates=15000,
+                                              mix_num_updates_decay=1500,
+                                              big_mid_rounds_num_updates=5000, 
+                                              big_mid_rounds_num_updates_decay=500, 
                                               mq_rounds=1, 
-                                              big_final_round_num_updates=5000,
+                                              big_final_round_num_updates=20000,
                                               big_buffer_size=256,
                                               big_final_round_num_updates_decay=1),
         
-        'gravitar_baseline': get_gravitar_job(mix_num_agents=4,
-                                              num_envs=32,
-                                              buffer_per_agent=32,
+        'gravitar_baseline': get_gravitar_job(mix_num_agents=2,
+                                              num_envs=64,
+                                              buffer_per_agent=64,
                                               img_size=128,
                                               mix_num_updates=1,
                                               mix_num_updates_decay=1,
                                               big_mid_rounds_num_updates=1, 
                                               big_mid_rounds_num_updates_decay=1, 
                                               mq_rounds=1, 
-                                              big_final_round_num_updates=15000,
+                                              big_final_round_num_updates=40000,
                                               big_buffer_size=256, 
-                                              big_final_round_num_updates_decay=1500),
+                                              big_final_round_num_updates_decay=4000),
         
     }
     

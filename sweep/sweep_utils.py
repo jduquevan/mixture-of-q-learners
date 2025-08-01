@@ -14,7 +14,7 @@ def get_compute_command(compute_type: str = "l40s", job_name: str = 'meltingpot_
     if compute_type == "l40s":
         base =  'sbatch  --time=12:0:0  --gres=gpu:l40s:1 --partition=long --cpus-per-task=12 --mem=64G'
     elif compute_type == "a100l":
-        base = 'sbatch  --time=12:0:0  --gres=gpu:a100l:1 --partition=long --cpus-per-task=12 --mem=64G'
+        base = 'sbatch  --time=48:0:0  --gres=gpu:a100l:1 --partition=long --cpus-per-task=12 --mem=64G'
     elif compute_type == "a100l_unkillable":
         base = 'sbatch  --time=12:0:0  --gres=gpu:a100l:1 --partition=unkillable --cpus-per-task=6 --mem=32G'
     elif compute_type == "a100l_main":

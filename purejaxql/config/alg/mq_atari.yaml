@@ -36,6 +36,9 @@ big:
     NUM_UPDATES_DECAY: 50
     NUM_ENVS: 64
     NUM_TEST_ENVS: 8
+    DONT_FILL_BUFFER: True
+    NUM_ENVS_TO_TRAIN_BIG_AGENT: 16
+    EXPLORATION_EPS_SCHEDULER: "disabled"
   final_round:
     NUM_UPDATES: 5000
     NUM_UPDATES_DECAY: 5000
@@ -59,3 +62,5 @@ ENV_KWARGS:
 TEST_DURING_TRAINING: True 
 TEST_ENVS: 4
 EPS_TEST: 0. # 0 for greedy test policy
+
+VERBOSE: False

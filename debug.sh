@@ -9,7 +9,7 @@ python purejaxql/mq_atari.py \
     cluster@_global_=milad_mila \
     alg.ENV_NAME=Breakout-v5 \
     alg.mix.NUM_AGENTS=4 \
-    alg.NUM_ENVS=32 \
+    alg.NUM_ENVS=8 \
     alg.mix.BUFFER_PER_AGENT=32 \
     +alg.ENV_KWARGS.img_width=84 \
     +alg.ENV_KWARGS.img_height=84 \
@@ -26,3 +26,4 @@ python purejaxql/mq_atari.py \
     alg.big.mid_rounds.NUM_TEST_ENVS=8 \
     alg.big.final_round.NUM_ENVS=128 \
     alg.big.final_round.NUM_TEST_ENVS=16 \
+    alg.big.mid_rounds.EXPLORATION_EPS_SCHEDULER=uniform_0.1 \

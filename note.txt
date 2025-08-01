@@ -89,3 +89,9 @@ In order to fix this, it should depend on the mx_updates. That is the thing that
 The epsilon scheduler itself should implement the iterative nature of jumping to 1.0 and back to 0.0 again.
 
 
+# July 28th 2025
+Mixing is not improving performance. This should happen. Therefore, there is a bug in our setup.
+Hypothesis 1: Batch size was small because the batch size of the big agent was infered wrong. 
+Testing Hypothesis 1: 
+
+
