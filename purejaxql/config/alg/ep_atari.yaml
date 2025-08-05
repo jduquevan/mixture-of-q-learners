@@ -1,0 +1,42 @@
+ALG_NAME: "ep"
+
+# general training 
+NUM_ENVS: 256 # parallel environments
+NUM_STEPS: 32 # steps per environment in each update
+NUM_EPOCHS: 2 # number of epochs per update
+NUM_MINIBATCHES: 32 # minibatches per epoch
+NORM_TYPE: "layer_norm" # layer_norm or batch_norm
+LR: 0.00025
+MAX_GRAD_NORM: 10
+LR_LINEAR_DECAY: False
+GAMMA: 0.99
+LAMBDA: 0.65
+EPS_START: 1.
+EPS_FINISH: 0.0136
+REW_SCALE: 1.0
+
+# ep training
+ROUNDS: 1
+NUM_UPDATES: 100_000
+NUM_UPDATES_DECAY: 1_000
+DEPTH_EXPLORATION_EPS_SCHEDULER: "depth_exploration_0.1_U0.3"
+ENV_WISE_EXPLORATION_EPS_SCHEDULER: "envwise50D50R_U0.3"
+EXPLORATION_PERIOD: 1000
+BUFFER_SIZE: 512
+SAVE_CHECKPOINT_EVERY: 100_000
+
+# env specific (see https://envpool.readthedocs.io/en/latest/env/atari.html)
+ENV_NAME: "Pong-v5"
+ENV_KWARGS:
+  episodic_life: True # lost life -> done, increases sample efficiency, may hurt in some games
+  reward_clip: True # reward into -1, 1
+  repeat_action_probability: 0. # sticky actions
+  frame_skip: 4
+  noop_max: 30
+
+# evaluation
+TEST_DURING_TRAINING: True 
+NUM_TEST_ENVS: 4
+EPS_TEST: 0. # 0 for greedy test policy
+
+VERBOSE: False

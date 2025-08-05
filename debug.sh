@@ -1,29 +1,20 @@
 #source /home/mila/a/aghajohm/repos/mixture-of-q-learners/load_env.sh
 
-python purejaxql/mq_atari.py \
-    RUN_ID=test_1103 \
+python purejaxql/ep_atari.py \
+    RUN_ID=test_1278 \
     DEBUG=False \
     WANDB_MODE=online \
-    WANDB_TAGS=[gravitar_baseline] \
+    WANDB_TAGS=[ep_atari] \
     SEED=42 \
     cluster@_global_=milad_mila \
     alg.ENV_NAME=Breakout-v5 \
-    alg.mix.NUM_AGENTS=4 \
-    alg.NUM_ENVS=8 \
-    alg.mix.BUFFER_PER_AGENT=32 \
+    alg.NUM_ENVS=1024 \
     +alg.ENV_KWARGS.img_width=84 \
     +alg.ENV_KWARGS.img_height=84 \
-    alg.mix.NUM_UPDATES=10 \
-    alg.mix.NUM_UPDATES_DECAY=5 \
-    alg.big.mid_rounds.NUM_UPDATES=10 \
-    alg.big.mid_rounds.NUM_UPDATES_DECAY=5 \
-    alg.mq.rounds=3 \
-    alg.big.final_round.NUM_UPDATES=50 \
-    alg.big.final_round.NUM_UPDATES_DECAY=10 \
-    alg.big.mid_rounds.fill.NUM_ENVS=4 \
-    alg.big.mid_rounds.fill.NUM_TEST_ENVS=2 \
-    alg.big.mid_rounds.NUM_ENVS=64 \
-    alg.big.mid_rounds.NUM_TEST_ENVS=8 \
-    alg.big.final_round.NUM_ENVS=128 \
-    alg.big.final_round.NUM_TEST_ENVS=16 \
-    alg.big.mid_rounds.EXPLORATION_EPS_SCHEDULER=uniform_0.1 \
+    alg.NUM_UPDATES=100 \
+    alg.NUM_UPDATES_DECAY=5 \
+    alg.ROUNDS=3 \
+    alg.DEPTH_EXPLORATION_EPS_SCHEDULER=depth_exploration_0.1_U0.3 \
+    alg.ENV_WISE_EXPLORATION_EPS_SCHEDULER=envwise50D50R_U0.3 \
+    alg.BUFFER_SIZE=1024 \
+    
