@@ -17,8 +17,8 @@
 #SBATCH --mem=40G
 #SBATCH --time=0-23:59:00
 #SBATCH --gres=gpu:a100l:1
-#SBATCH --partition=long
-#SBATCH --cpus-per-task=16
+#SBATCH --partition=main
+#SBATCH --cpus-per-task=8
 
 # Submit jobs.
 module purge
@@ -26,7 +26,6 @@ eval "$(conda shell.bash hook)"
 conda deactivate
 module load cuda/12.0
 export HYDRA_FULL_ERROR=1
-source ../.venv/bin/activate
 
 # Define all arguments
 SEED=${1}
@@ -35,12 +34,12 @@ LR=${3}
 ENT=${4}
 
 # Construct the full command
-CMD="python ppomix_se.py \
+CMD="CUDA_VISIBLE_DEVICES=0 python ppomix_lstm.py \
     SEED=${SEED} \
     alg.NUM_EPOCHS=${PPO_EPOCHS} \
     alg.LR=${LR} \
     alg.ENT_COEFF=${ENT} \
-    alg.NUM_ENVS=512 \
+    alg.NUM_ENVS=1024 \
     alg.ENV_NAME=Gravitar-v5"
 
 # Print the full command for debugging

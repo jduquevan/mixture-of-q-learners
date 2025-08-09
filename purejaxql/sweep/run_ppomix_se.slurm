@@ -35,7 +35,7 @@ LR=${3}
 ENT=${4}
 
 # Construct the full command
-CMD="python ppomix_se.py \
+CMD="python ppomix.py \
     SEED=${SEED} \
     alg.NUM_EPOCHS=${PPO_EPOCHS} \
     alg.LR=${LR} \
