@@ -94,6 +94,13 @@ ATARI_SCORES = {
     "Zaxxon-v5": (32.5, 9173.3),
 }
 
+cpu = jax.devices("cpu")[0]
+
+@partial(jax.jit, static_argnums=(0,), device=cpu)
+def _cpu_step(self, handle, action):
+    """ Low-level EnvPool step that always runs on the host CPU. """
+    return self._raw_step_f(handle, action)
+
 
 @struct.dataclass
 class LogEnvState:
@@ -123,7 +130,7 @@ class JaxLogEnvPoolWrapper(gym.Wrapper):
         self.init_handle = handle
         self.send_f = send
         self.recv_f = recv
-        self.step_f = step
+        self._raw_step_f = step
 
     def reset(self, **kwargs):
         observations = super(JaxLogEnvPoolWrapper, self).reset(**kwargs)
@@ -140,8 +147,8 @@ class JaxLogEnvPoolWrapper(gym.Wrapper):
 
     @partial(jax.jit, static_argnums=(0,))
     def step(self, state, action):
-        new_handle, (observations, rewards, dones, infos) = self.step_f(
-            state.handle, action
+        new_handle, (observations, rewards, dones, infos) = _cpu_step(
+            self, state.handle, action
         )
 
         new_episode_return = state.episode_returns + infos["reward"]
@@ -436,10 +443,6 @@ def make_train(config):
     
     envs_per_agent = num_envs + config["TEST_ENVS"] if config.get("TEST_DURING_TRAINING", False) else num_envs
     total_envs = (envs_per_agent * num_agents)
-    env = make_env(total_envs)
-
-    # here reset must be out of vmap and jit
-    init_obs, env_state = env.reset()
 
     def train(rng):
         original_seed = rng[0]
@@ -449,12 +452,16 @@ def make_train(config):
         agents_per_dev  = config["NUM_AGENTS"] // n_dev
         assert agents_per_dev * n_dev == config["NUM_AGENTS"], (
             "NUM_AGENTS must be divisible by #GPUs")
+        local_envs = agents_per_dev * envs_per_agent
+
+        env = make_env(local_envs)
+        init_obs, env_state = env.reset()
 
         def slice_agents(x):
-            """Take a pytree with leading axis = NUM_AGENTS and
-            keep only the slice that belongs to this replica."""
-            x = x.reshape((n_dev, agents_per_dev) + x.shape[1:])   # (n_dev, agents_per_dev, …)
-            return jax.lax.index_in_dim(x, jax.lax.axis_index("devices"), keepdims=False)
+            # x has shape (NUM_AGENTS, …); we reshape into (n_dev, agents_per_dev, …)
+            x = x.reshape((n_dev, agents_per_dev) + x.shape[1:])  
+            idx = jax.lax.axis_index("devices")           # this is a tracer inside pmap
+            return jnp.take(x, idx, axis=0)  
 
         # INIT NETWORK AND OPTIMIZER
         network = ActorCritic(
@@ -479,7 +486,7 @@ def make_train(config):
             # SAMPLE PHASE
             def _step_env(carry, _):
                 last_obs, env_state, rng = carry
-                rng, rng_a, rng_s = jax.random.split(rng, 3)
+                rng, rng_a, _ = jax.random.split(rng, 3)
                 logits = jax.vmap(
                     lambda ts, obs: network.apply(
                         {"params": ts.params, 'batch_stats': ts.batch_stats},
@@ -691,20 +698,23 @@ def make_train(config):
                 for k, v in env_metrics.items():
                     metrics[f"agent_{g}/{k}"] = v[local_i]
             
-            # report on wandb if required
-            if config["WANDB_MODE"] != "disabled":
-                def callback(metrics, original_seed):
-                    if config.get("WANDB_LOG_ALL_SEEDS", False):
-                        metrics.update(
-                            {
-                                f"rng{int(original_seed)}/{k}": v
-                                for k, v in metrics.items()
-                            }
-                        )
-                    first_key = f"agent_{agent_offset}/update_steps"
-                    wandb.log(metrics, step=int(metrics[first_key]))
+            device_id = jax.lax.axis_index("devices")
 
-                jax.debug.callback(callback, metrics, original_seed)
+            def _host_log(device_id, metrics, original_seed):
+                # convert tracers to scalars
+                metrics = jax.tree_util.tree_map(
+                    lambda x: float(x) if np.ndim(x) == 0 else x, metrics
+                )
+
+                if config.get("WANDB_LOG_ALL_SEEDS", False):
+                    metrics = {f"rng{int(original_seed)}/{k}": v for k, v in metrics.items()}
+
+                if device_id == 0:                       # only replica 0 logs
+                    first_key = next(k for k in metrics if k.endswith("/update_steps"))
+                    wandb.log(metrics, step=int(metrics[first_key]))
+            
+            if config["WANDB_MODE"] != "disabled":
+                jax.debug.callback(_host_log, device_id, metrics, original_seed)
 
             runner_state = (critic_train_states, actor_train_states, tuple(expl_state), test_metrics, rng)
 
@@ -715,8 +725,7 @@ def make_train(config):
 
         # train
         rng, _rng = jax.random.split(rng)
-        init_obs  = slice_agents(init_obs)     # keeps agents_per_dev × envs_per_agent
-        env_state = slice_agents(env_state)
+
         expl_state = (init_obs, env_state)
         runner_state = (critic_train_states, actor_train_states, expl_state, test_metrics, _rng)
 
