@@ -27,8 +27,8 @@ ENV_KWARGS:
   repeat_action_probability: 0. # sticky actions
   frame_skip: 4
   noop_max: 30
-  img_width: 512
-  img_height: 512
+  img_width: 256
+  img_height: 256
 
 # evaluation
 TEST_DURING_TRAINING: True 

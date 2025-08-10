@@ -16,7 +16,7 @@ CLIP_EPS: 0.1
 ENT_COEFF: 0.01
 
 # mixing
-MIXING_STEPS: 500            # every N PPO updates do a weighted merge
+MIXING_STEPS: 50000000            # every N PPO updates do a weighted merge
 EMA_ALPHA: 0.05 
 
 # env specific, see https://envpool.readthedocs.io/en/latest/env/atari.html
