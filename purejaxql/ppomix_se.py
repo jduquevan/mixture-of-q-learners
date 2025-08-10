@@ -902,8 +902,8 @@ def make_train(config):
                 tau = config.get("MIX_TAU", 2.0)           # temperature for softmax
 
                 # ---------- weights over agents ----------------------------------------
-                # w = jax.nn.softmax(critic_train_states.ema_return / tau)   # shape (A,)
-                w = jax.nn.softmax(jnp.ones(A,)) 
+                w = jax.nn.softmax(critic_train_states.ema_return / tau)   # shape (A,)
+                # w = jax.nn.softmax(jnp.ones(A,))
 
                 # ---------- parameter averages -----------------------------------------
                 merged_critic = _merge_params(critic_train_states.params,  w)
@@ -940,9 +940,12 @@ def make_train(config):
             critic_train_states, actor_train_states = jax.lax.cond(
                 do_mix, _mix_states, _skip_states, operand=None
             )
+            tau = config.get("MIX_TAU", 2.0)
+            mix_w = jax.nn.softmax(critic_train_states.ema_return / tau)
 
             metrics = {}
             for i in range(config["NUM_AGENTS"]):
+                metrics[f"agent_{i}/mix_weight_from_ema"] = mix_w[i]
                 metrics[f"agent_{i}/ema_return"] = critic_train_states.ema_return[i]
                 metrics[f"agent_{i}/env_step"] = critic_train_states.timesteps[i]
                 metrics[f"agent_{i}/update_steps"] = critic_train_states.n_updates[i]
