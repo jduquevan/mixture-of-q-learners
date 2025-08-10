@@ -1,7 +1,7 @@
 defaults:
   - _self_
   - cluster@_global_: juan_mila.yaml
-  - alg: ppomix_multi_gpu.yaml
+  - alg: ppomix.yaml
 # experiment params
 NUM_SEEDS: 1
 SEED: 0
@@ -20,4 +20,4 @@ alg:
   WANDB_LOG_ALL_SEEDS: False # will log all the vmapped seeds separetely
 
 # where to save the params (if None, will not save)
-SAVE_PATH: "./models"
+SAVE_PATH: None
