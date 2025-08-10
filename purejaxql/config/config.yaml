@@ -1,7 +1,7 @@
 defaults:
   - _self_
   - cluster@_global_: juan_mila.yaml
-  - alg: ppomix.yaml
+  - alg: ppomix_se.yaml
 # experiment params
 NUM_SEEDS: 1
 SEED: 0
