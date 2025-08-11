@@ -15,7 +15,7 @@
 #SBATCH -N 1 #nodes
 #SBATCH -n 1 #tasks
 #SBATCH --account=rrg-bengioy-ad
-#SBATCH --cpus-per-task=8
+#SBATCH --cpus-per-task=16
 #SBATCH --mem=40G
 #SBATCH --time=0-23:59:00   
 #SBATCH --gpus=nvidia_h100_80gb_hbm3_3g.40gb:1
@@ -32,17 +32,19 @@ source /project/rrg-bengioy-ad/jduque/mixture-of-q-learners/.venv/bin/activate
 
 # Define all arguments
 SEED=${1}
-PPO_EPOCHS=${2}
-LR=${3}
-ENT=${4}
+ENT=${2}
+DIV=${3}
+MSTEPS=${4}
+TAU=${5}
 
 # Construct the full command
-CMD="CUDA_VISIBLE_DEVICES=0 python  /project/rrg-bengioy-ad/jduque/mixture-of-q-learners/purejaxql/ppomix.py \
+CMD="CUDA_VISIBLE_DEVICES=0 python  /project/rrg-bengioy-ad/jduque/mixture-of-q-learners/purejaxql/ppomix_se.py \
     SEED=${SEED} \
-    alg.NUM_EPOCHS=${PPO_EPOCHS} \
-    alg.LR=${LR} \
     alg.ENT_COEFF=${ENT} \
-    alg.NUM_ENVS=32 \
+    alg.DIVERSITY_COEFF=${DIV} \
+    alg.MIXING_STEPS=${MSTEPS} \
+    alg.MIX_TAU=${TAU} \
+    alg.NUM_ENVS=128 \
     alg.NUM_AGENTS=4 \
     alg.ENV_NAME=Gravitar-v5"
 
