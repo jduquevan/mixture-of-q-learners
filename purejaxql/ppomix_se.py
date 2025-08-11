@@ -231,121 +231,13 @@ class CNN(nn.Module):
         x = nn.relu(x)
         return x
 
-
-# ---------- Fire module with LayerNorm ----------
-
-class FireLN(nn.Module):
-    s1x1: int
-    e1x1: int
-    e3x3: int
-    act: callable = nn.relu
-    ln_eps: float = 1e-5
-    post_ln: bool = False  # set True to also LN after concatenation
-
-    @nn.compact
-    def __call__(self, x, *, train: bool):
-        # Squeeze
-        x = nn.Conv(self.s1x1, kernel_size=(1,1),
-                    kernel_init=nn.initializers.he_normal())(x)
-        x = nn.LayerNorm(epsilon=self.ln_eps)(x)
-        x = self.act(x)
-
-        # Expand
-        e1 = nn.Conv(self.e1x1, kernel_size=(1,1),
-                     kernel_init=nn.initializers.he_normal())(x)
-        e1 = nn.LayerNorm(epsilon=self.ln_eps)(e1)
-        e1 = self.act(e1)
-
-        e3 = nn.Conv(self.e3x3, kernel_size=(3,3), padding="SAME",
-                     kernel_init=nn.initializers.he_normal())(x)
-        e3 = nn.LayerNorm(epsilon=self.ln_eps)(e3)
-        e3 = self.act(e3)
-
-        y = jnp.concatenate([e1, e3], axis=-1)
-        if self.post_ln:
-            y = nn.LayerNorm(epsilon=self.ln_eps)(y)
-        return y
-
-
-# ---------- SqueezeNet v1.0 / v1.1 with LayerNorm (encoder) ----------
-
-class SqueezeNetLN(nn.Module):
-    """SqueezeNet encoder with LayerNorm, outputs an embedding for RL."""
-    version: Literal["1.0", "1.1"] = "1.1"
-    embed_dim: int = 512
-    dropout_rate: float = 0.5       # dropout after last Fire (like v1.0 paper)
-    act: callable = nn.relu
-    ln_eps: float = 1e-5
-    post_ln: bool = False           # also LN after Fire concat if True
-
-    @nn.compact
-    def __call__(self, x: jnp.ndarray, *, train: bool):
-        # Expect NHWC, values in [0,1]. If you pass uint8, normalize before.
-        if self.version == "1.1":
-            # v1.1: smaller/faster stem
-            x = nn.Conv(64, kernel_size=(3,3), strides=(2,2),
-                        padding="SAME",
-                        kernel_init=nn.initializers.he_normal())(x)
-            x = nn.LayerNorm(epsilon=self.ln_eps)(x)
-            x = self.act(x)
-            x = nn.max_pool(x, window_shape=(3,3), strides=(2,2), padding="SAME")
-
-            x = FireLN(16, 64, 64, act=self.act, ln_eps=self.ln_eps, post_ln=self.post_ln)(x, train=train)  # fire2
-            x = FireLN(16, 64, 64, act=self.act, ln_eps=self.ln_eps, post_ln=self.post_ln)(x, train=train)  # fire3
-            x = FireLN(32,128,128, act=self.act, ln_eps=self.ln_eps, post_ln=self.post_ln)(x, train=train)  # fire4
-            x = nn.max_pool(x, window_shape=(3,3), strides=(2,2), padding="SAME")
-            x = FireLN(32,128,128, act=self.act, ln_eps=self.ln_eps, post_ln=self.post_ln)(x, train=train)  # fire5
-            x = FireLN(48,192,192, act=self.act, ln_eps=self.ln_eps, post_ln=self.post_ln)(x, train=train)  # fire6
-            x = FireLN(48,192,192, act=self.act, ln_eps=self.ln_eps, post_ln=self.post_ln)(x, train=train)  # fire7
-            x = FireLN(64,256,256, act=self.act, ln_eps=self.ln_eps, post_ln=self.post_ln)(x, train=train)  # fire8
-            x = nn.max_pool(x, window_shape=(3,3), strides=(2,2), padding="SAME")
-            x = FireLN(64,256,256, act=self.act, ln_eps=self.ln_eps, post_ln=self.post_ln)(x, train=train)  # fire9
-
-        else:
-            # v1.0: 7x7 stem
-            x = nn.Conv(96, kernel_size=(7,7), strides=(2,2),
-                        padding="SAME",
-                        kernel_init=nn.initializers.he_normal())(x)
-            x = nn.LayerNorm(epsilon=self.ln_eps)(x)
-            x = self.act(x)
-            x = nn.max_pool(x, window_shape=(3,3), strides=(2,2), padding="SAME")
-
-            x = FireLN(16, 64, 64, act=self.act, ln_eps=self.ln_eps, post_ln=self.post_ln)(x, train=train)  # fire2
-            x = FireLN(16, 64, 64, act=self.act, ln_eps=self.ln_eps, post_ln=self.post_ln)(x, train=train)  # fire3
-            x = FireLN(32,128,128, act=self.act, ln_eps=self.ln_eps, post_ln=self.post_ln)(x, train=train)  # fire4
-            x = nn.max_pool(x, window_shape=(3,3), strides=(2,2), padding="SAME")
-            x = FireLN(32,128,128, act=self.act, ln_eps=self.ln_eps, post_ln=self.post_ln)(x, train=train)  # fire5
-            x = FireLN(48,192,192, act=self.act, ln_eps=self.ln_eps, post_ln=self.post_ln)(x, train=train)  # fire6
-            x = FireLN(48,192,192, act=self.act, ln_eps=self.ln_eps, post_ln=self.post_ln)(x, train=train)  # fire7
-            x = FireLN(64,256,256, act=self.act, ln_eps=self.ln_eps, post_ln=self.post_ln)(x, train=train)  # fire8
-            x = nn.max_pool(x, window_shape=(3,3), strides=(2,2), padding="SAME")
-            x = FireLN(64,256,256, act=self.act, ln_eps=self.ln_eps, post_ln=self.post_ln)(x, train=train)  # fire9
-
-        # (Optional) dropout like the original paper (after fire9)
-        if self.dropout_rate and self.dropout_rate > 0.0:
-            x = nn.Dropout(rate=self.dropout_rate)(x, deterministic=not train)
-
-        # Global average pooling → embedding
-        x = jnp.mean(x, axis=(1, 2))
-        x = nn.Dense(self.embed_dim, kernel_init=nn.initializers.he_normal())(x)
-        x = self.act(x)
-        return x
-
 class ActorCritic(nn.Module):
     action_dim: int
     norm_type: str = "layer_norm"
     norm_input: bool = False       
 
     def setup(self):
-        # self.encoder = CNN(norm_type=self.norm_type, name="cnn")
-        self.encoder = SqueezeNetLN(
-            version="1.1",        
-            embed_dim=512,
-            dropout_rate=0.0,     # set 0.0 if you prefer no dropout in RL
-            act=nn.relu,          
-            post_ln=False,        
-            name="cnn",
-        )
+        self.encoder = CNN(norm_type=self.norm_type, name="cnn")
         self.actor_head  = nn.Dense(self.action_dim, name="actor_head")
         self.critic_head = nn.Dense(1, name="critic_head")
     
@@ -704,7 +596,12 @@ def make_train(config):
                 gamma    = config["GAMMA"],
                 lam      = config["LAMBDA"],
             )
-            gae_advantages = (gae_advantages - gae_advantages.mean()) / (gae_advantages.std() + 1e-8)
+            def _norm_adv_per_agent_batch(adv_mb: jnp.ndarray) -> jnp.ndarray:
+                mean = adv_mb.mean(axis=1, keepdims=True)
+                std  = adv_mb.std(axis=1, keepdims=True) + 1e-8
+                return (adv_mb - mean) / std
+            
+            # gae_advantages = (gae_advantages - gae_advantages.mean()) / (gae_advantages.std() + 1e-8)
             
             def _learn_epoch(carry, _):
                 critic_train_states, actor_train_states, encoder_train_states, rng = carry
@@ -715,6 +612,7 @@ def make_train(config):
                 targets = jax.tree_util.tree_map(lambda x: jnp.swapaxes(x, 0, 1), targets)
                 advantages = jax.tree_map(lambda x: preprocess_transitions_per_agent(x, _rng, config), gae_advantages)
                 advantages = jax.tree_util.tree_map(lambda x: jnp.swapaxes(x, 0, 1), advantages)
+                advantages = jax.vmap(_norm_adv_per_agent_batch, in_axes=0)(advantages)
 
                 def _learn_phase(carry, minibatch_and_target):
                     critic_train_states, actor_train_states, encoder_train_states, rng = carry
@@ -739,16 +637,12 @@ def make_train(config):
                         network.apply({"params": ts.params}, div_feats,
                                     train=False, method=ActorCritic.actor)
                     )(actor_train_states)
-                    probs_all, _, _ = _policy_from_logits(logits_all)
+                    probs_all, logprobs_all, _ = _policy_from_logits(logits_all)
+                    logprobs_all = jax.lax.stop_gradient(logprobs_all)
 
-                    # leave-one-out mean of others, per agent: [A, S, Act]
-                    sum_probs = probs_all.sum(axis=0, keepdims=True)                
-                    mean_others = (sum_probs - probs_all) / jnp.maximum(1, A - 1)    
-                    mean_others = jnp.clip(mean_others, 1e-6, 1.0)
-                    mean_others = jax.lax.stop_gradient(mean_others)
                     div_coef = config.get("DIVERSITY_COEFF", 0.0) * (A > 1)
 
-                    def agent_loss_and_update(cts, ats, minibatch, target, ets, mean_others_i, adv_i, i):
+                    def agent_loss_and_update(cts, ats, minibatch, target, ets, logprobs_all, adv_i, i):
                         # Critic loss and update
                         def _critic_loss_fn(critic_params, encoder_params):
                             features = network.apply(
@@ -789,9 +683,7 @@ def make_train(config):
                             ratio  = jnp.exp(logp_a - minibatch.log_p.squeeze(-1))
 
                             clip_eps = config["CLIP_EPS"]
-                            # unclipped = ratio * advantage
                             unclipped = ratio * adv_i
-                            # clipped   = jnp.clip(ratio, 1-clip_eps, 1+clip_eps) * advantage
                             clipped   = jnp.clip(ratio, 1-clip_eps, 1+clip_eps) * adv_i
                             pg_loss   = -jnp.mean(jnp.minimum(unclipped, clipped))
 
@@ -803,13 +695,16 @@ def make_train(config):
                             logits_div = network.apply({"params": actor_params},
                                        div_feats, train=True, method=ActorCritic.actor)
                             probs_div, logprobs_div, _ = _policy_from_logits(logits_div)  # [S,Act]
-                            # KL(pi_i || mean_{-i}) averaged over S
-                            kl = jnp.mean(jnp.sum(probs_div * (logprobs_div - jnp.log(mean_others_i)), axis=-1))
+
+                            sum_logp_others  = jnp.sum(logprobs_all, axis=0) - logprobs_all[i]
+                            mean_logp_others = sum_logp_others / jnp.maximum(1, A - 1)
+                            ce_mean = -jnp.mean(jnp.sum(probs_div * mean_logp_others, axis=-1))
+
 
                             div_coef_i = jnp.where(is_exempt, 0.0, div_coef)
 
-                            loss = pg_loss + ent_coeff * ent_loss - div_coef_i * kl
-                            aux  = {"entropy": jnp.mean(entropy), "kl": kl}
+                            loss = pg_loss + ent_coeff * ent_loss - div_coef_i * ce_mean
+                            aux  = {"entropy": jnp.mean(entropy), "kl": ce_mean}
                             return loss, aux
 
                         (actor_loss, aux), grads = jax.value_and_grad(_actor_loss_fn, argnums=(0, 1), has_aux=True)(ats.params, ets.params)
@@ -823,8 +718,8 @@ def make_train(config):
                         
                         return critic_loss, actor_loss, entropies, kl, cts, ats, encoder_c_grad, encoder_a_grad
                     
-                    critic_loss, actor_loss, entropies, kls, new_critic_train_states, new_actor_train_states, encoder_c_grad, encoder_a_grad = jax.vmap(agent_loss_and_update, in_axes=(0,0,0,0, None, 0,0,0))(
-                        critic_train_states, actor_train_states, minibatch, target, encoder_train_states, mean_others, advantage, agent_ids
+                    critic_loss, actor_loss, entropies, kls, new_critic_train_states, new_actor_train_states, encoder_c_grad, encoder_a_grad = jax.vmap(agent_loss_and_update, in_axes=(0,0,0,0, None, None,0,0))(
+                        critic_train_states, actor_train_states, minibatch, target, encoder_train_states, logprobs_all, advantage, agent_ids
                     )
 
                     def mean_over_agents(tree): return jax.tree_map(lambda x: x.mean(0), tree)
@@ -872,11 +767,6 @@ def make_train(config):
             actor_train_states  = actor_train_states.replace(mix_counter  = actor_train_states.mix_counter  + 1)
 
             def _merge_params(stacked_params, weights):
-                """
-                `stacked_params`: PyTree whose leaves are shape (A, …)
-                `weights`       : (A,) normalised, positive
-                returns         : PyTree with agent axis removed via weighted sum
-                """
                 return jax.tree_util.tree_map(
                     lambda x: jnp.tensordot(weights, x, axes=1),   # (A, …) → (…)
                     stacked_params,
@@ -889,32 +779,18 @@ def make_train(config):
             do_mix = jnp.max(critic_train_states.mix_counter) >= config["MIXING_STEPS"]
 
             def _mix_states(_):
-                """
-                Merge agents by soft-averaging their parameters, then
-                (1) zero BN running stats and
-                (2) re-initialise optimiser states.
-
-                Returns
-                -------
-                (new_critic_states, new_actor_states)
-                """
                 A   = config["NUM_AGENTS"]
-                tau = config.get("MIX_TAU", 2.0)           # temperature for softmax
+                tau = config.get("MIX_TAU", 2.0)
 
-                # ---------- weights over agents ----------------------------------------
                 w = jax.nn.softmax(critic_train_states.ema_return / tau)   # shape (A,)
                 # w = jax.nn.softmax(jnp.ones(A,))
 
-                # ---------- parameter averages -----------------------------------------
                 merged_critic = _merge_params(critic_train_states.params,  w)
                 merged_actor  = _merge_params(actor_train_states.params,   w)
 
-                # ---------- replicate for every agent ----------------------------------
                 critic_pack = _repeat_pytree(merged_critic, A)
                 actor_pack  = _repeat_pytree(merged_actor,  A)
 
-
-                # ---------- 2) re-initialise optimiser slots ---------------------------
                 def _reset_opt(ts: TrainState):
                     return ts.replace(opt_state = ts.tx.init(ts.params))
 
@@ -1051,11 +927,6 @@ def main(config):
     print(config)
     if config["DEBUG"]:
         jax.config.update("jax_disable_jit", True)
-        # import debugpy
-        # debugpy.listen(5678)
-        # print("Waiting for client to attach...")
-        # debugpy.wait_for_client()
-        # print("Client attached")
     print("Config:\n", OmegaConf.to_yaml(config))
     
 

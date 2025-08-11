@@ -1,4 +1,4 @@
-ALG_NAME: "ppomix"
+ALG_NAME: "ppomix_se"
 TOTAL_TIMESTEPS: 5e9 # with 4 frame skip correpsnds to 200M frames
 TOTAL_TIMESTEPS_DECAY: 5e9 # will be used for decay functions (epsilon and lr)
 NUM_ENVS: 128 # parallel environments
@@ -20,7 +20,7 @@ DIV_SAMPLES: 64
 # mixing
 MIXING_STEPS: 100            # every N PPO updates do a weighted merge
 EMA_ALPHA: 0.05
-MIX_TAU: 100 
+MIX_TAU: 0.03
 
 # env specific, see https://envpool.readthedocs.io/en/latest/env/atari.html
 ENV_NAME: "Pong-v5"
