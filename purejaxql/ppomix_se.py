@@ -277,6 +277,7 @@ class CriticState(TrainState):
     n_updates: int = 0
     grad_steps: int = 0
     ema_return: jnp.ndarray = 0.0
+    ema_train_return: jnp.ndarray = 0.0
     mix_counter: jnp.ndarray = 0
 
 class ActorState(TrainState):
@@ -284,6 +285,7 @@ class ActorState(TrainState):
     n_updates: int = 0
     grad_steps: int = 0
     ema_return: jnp.ndarray = 0.0
+    ema_train_return: jnp.ndarray = 0.0
     mix_counter: jnp.ndarray = 0
 
 @jax.jit
@@ -341,16 +343,16 @@ def compute_agent_metrics(metrics, config):
 def initialize_agents(config, env, rng, network):
     num_agents = config["NUM_AGENTS"]
     dummy_x = jnp.zeros((1, *env.single_observation_space.shape))
+    dummy_feat = jnp.zeros((1, 512))
 
     encoder_vars = network.init(rng, dummy_x, train=True, method=ActorCritic.encode)
     encoder_params = encoder_vars["params"]
 
-    dummy_feat = jnp.zeros((1, 512))
+    critic_vars = network.init(rng, dummy_feat, train=True, method=ActorCritic.critic)
+    critic_params = critic_vars["params"]
+
     actor_params = jax.vmap(lambda k:
         network.init(k, dummy_feat, train=False, method=ActorCritic.actor)["params"]
-    )(jax.random.split(rng, config["NUM_AGENTS"]))
-    critic_params = jax.vmap(lambda k:
-        network.init(k, dummy_feat, train=False, method=ActorCritic.critic)["params"]
     )(jax.random.split(rng, config["NUM_AGENTS"]))
 
 
@@ -373,16 +375,22 @@ def initialize_agents(config, env, rng, network):
         tx=tx(lr_sched),
     )
 
+    critic_states = CriticState.create(
+        apply_fn=network.apply, 
+        params=critic_params,
+        tx=tx(lr_sched),
+    )
+
+    critic_states = critic_states.replace(
+        ema_return=jnp.zeros((config["NUM_AGENTS"],), dtype=jnp.float32),
+        ema_train_return=jnp.zeros((config["NUM_AGENTS"],), dtype=jnp.float32),
+    )
+
     def _index(tree, i):
         return jax.tree_util.tree_map(lambda x: x[i], tree)
     
     def make_head_states(i):
         return (
-            CriticState.create(
-                apply_fn=network.apply, 
-                params=_index(critic_params, i),
-                tx=tx(lr_sched),
-            ),
             ActorState.create(
                 apply_fn=network.apply, 
                 params=_index(actor_params,  i),
@@ -390,7 +398,7 @@ def initialize_agents(config, env, rng, network):
             )
         )
 
-    critic_states, actor_states = jax.vmap(make_head_states)(jnp.arange(num_agents))
+    actor_states = jax.vmap(make_head_states)(jnp.arange(num_agents))
     return critic_states, actor_states, encoder_states
 
 def _compute_gae(values, rewards, dones, gamma, lam):
@@ -447,6 +455,9 @@ def make_train(config):
     total_envs = (envs_per_agent * num_agents)
     env = make_env(total_envs)
 
+    score_min   = jnp.asarray(env.env_random_score, dtype=jnp.float32)
+    score_denom = jnp.asarray(env.env_human_score - env.env_random_score, dtype=jnp.float32)
+
     # here reset must be out of vmap and jit
     init_obs, env_state = env.reset()
 
@@ -479,6 +490,12 @@ def make_train(config):
                     train=False,
                     method=ActorCritic.encode
                 )
+                vals = network.apply(
+                    {"params": critic_train_states.params},
+                    features,
+                    train=False,
+                    method=ActorCritic.critic
+                )
                 logits = jax.vmap(
                     lambda ts, features: network.apply(
                         {"params": ts.params},
@@ -487,16 +504,6 @@ def make_train(config):
                         method=ActorCritic.actor)
                 )(
                     actor_train_states,
-                    features.reshape((config["NUM_AGENTS"], envs_per_agent, *features.shape[1:]))
-                )
-                vals = jax.vmap(
-                    lambda ts, features: network.apply(
-                        {"params": ts.params},
-                        features,
-                        train=False,
-                        method=ActorCritic.critic)
-                )(
-                    critic_train_states,
                     features.reshape((config["NUM_AGENTS"], envs_per_agent, *features.shape[1:]))
                 )
                 
@@ -514,7 +521,6 @@ def make_train(config):
                 probs, log_ps, _ = _policy_from_logits(logits)
                 log_ps = jnp.take_along_axis(log_ps, new_action[..., None], -1).reshape((config["NUM_AGENTS"]*envs_per_agent, 1))
                 new_action = new_action.reshape((config["NUM_AGENTS"]*envs_per_agent, *new_action.shape[2:]))
-                vals = vals.reshape((config["NUM_AGENTS"]*envs_per_agent, *vals.shape[2:]))
 
                 new_obs, new_env_state, reward, new_done, info = env.step(
                     env_state, new_action
@@ -578,15 +584,13 @@ def make_train(config):
                 train=False,
                 method=ActorCritic.encode
             )
-            last_next_value = jax.vmap(                               # over agents
-                lambda cts, features: network.apply(
-                    {"params": cts.params},
-                    features,
-                    train=False,
-                    method=ActorCritic.critic
-                ).squeeze(-1)
-            )(critic_train_states, features.reshape((config["NUM_AGENTS"], num_envs, *features.shape[1:]))) 
-
+            last_next_value = network.apply(
+                {"params": critic_train_states.params},
+                features,
+                train=False,
+                method=ActorCritic.critic
+            ).squeeze(-1)
+            
             values = jnp.concatenate([transitions.val.squeeze(-1),last_next_value.reshape((1, config["NUM_AGENTS"]*config["NUM_ENVS"]))], axis=0)
 
             gae_advantages, lambda_targets  = _compute_gae(
@@ -601,7 +605,7 @@ def make_train(config):
                 std  = adv_mb.std(axis=1, keepdims=True) + 1e-8
                 return (adv_mb - mean) / std
             
-            # gae_advantages = (gae_advantages - gae_advantages.mean()) / (gae_advantages.std() + 1e-8)
+            gae_advantages = (gae_advantages - gae_advantages.mean()) / (gae_advantages.std() + 1e-8)
             
             def _learn_epoch(carry, _):
                 critic_train_states, actor_train_states, encoder_train_states, rng = carry
@@ -612,7 +616,7 @@ def make_train(config):
                 targets = jax.tree_util.tree_map(lambda x: jnp.swapaxes(x, 0, 1), targets)
                 advantages = jax.tree_map(lambda x: preprocess_transitions_per_agent(x, _rng, config), gae_advantages)
                 advantages = jax.tree_util.tree_map(lambda x: jnp.swapaxes(x, 0, 1), advantages)
-                advantages = jax.vmap(_norm_adv_per_agent_batch, in_axes=0)(advantages)
+                # advantages = jax.vmap(_norm_adv_per_agent_batch, in_axes=0)(advantages)
 
                 def _learn_phase(carry, minibatch_and_target):
                     critic_train_states, actor_train_states, encoder_train_states, rng = carry
@@ -659,11 +663,12 @@ def make_train(config):
                             loss = 0.5 * jnp.mean((pred_val - target) ** 2)
                             return loss
                         critic_loss, grads = jax.value_and_grad(_critic_loss_fn, argnums=(0, 1))(cts.params, ets.params)
+                        critic_grad = grads[0]
                         encoder_c_grad = grads[1]
                         
-                        critic_updates, new_critic_opt_state = cts.tx.update(grads[0], cts.opt_state, cts.params)
-                        new_critic_params = optax.apply_updates(cts.params, critic_updates)
-                        cts = cts.replace(params=new_critic_params, opt_state=new_critic_opt_state, grad_steps=cts.grad_steps+1)
+                        # critic_updates, new_critic_opt_state = cts.tx.update(grads[0], cts.opt_state, cts.params)
+                        # new_critic_params = optax.apply_updates(cts.params, critic_updates)
+                        # cts = cts.replace(params=new_critic_params, opt_state=new_critic_opt_state, grad_steps=cts.grad_steps+1)
 
                         # Actor loss and update
                         def _actor_loss_fn(actor_params, encoder_params):
@@ -716,15 +721,22 @@ def make_train(config):
                         new_actor_params = optax.apply_updates(ats.params, actor_updates)
                         ats = ats.replace(params=new_actor_params, opt_state=new_actor_opt_state, grad_steps=ats.grad_steps+1)
                         
-                        return critic_loss, actor_loss, entropies, kl, cts, ats, encoder_c_grad, encoder_a_grad
+                        return critic_loss, actor_loss, entropies, kl, ats, critic_grad, encoder_c_grad, encoder_a_grad
                     
-                    critic_loss, actor_loss, entropies, kls, new_critic_train_states, new_actor_train_states, encoder_c_grad, encoder_a_grad = jax.vmap(agent_loss_and_update, in_axes=(0,0,0,0, None, None,0,0))(
+                    critic_loss, actor_loss, entropies, kls, new_actor_train_states, critic_grads, encoder_c_grad, encoder_a_grad = jax.vmap(agent_loss_and_update, in_axes=(None, 0,0,0, None, None,0,0))(
                         critic_train_states, actor_train_states, minibatch, target, encoder_train_states, logprobs_all, advantage, agent_ids
                     )
 
                     def mean_over_agents(tree): return jax.tree_map(lambda x: x.mean(0), tree)
+                    critic_grad = mean_over_agents(critic_grads)
                     encoder_grad = jax.tree_map(lambda gc, ga: mean_over_agents(gc) + mean_over_agents(ga), encoder_c_grad, encoder_a_grad)
+                    critic_updates, new_critic_opt_state = critic_train_states.tx.update(critic_grad, critic_train_states.opt_state, critic_train_states.params)
                     encoder_updates, new_encoder_opt_state = encoder_train_states.tx.update(encoder_grad, encoder_train_states.opt_state, encoder_train_states.params)
+                    new_critic_train_states = critic_train_states.replace(
+                        params=optax.apply_updates(critic_train_states.params, critic_updates),
+                        opt_state=new_critic_opt_state,
+                        grad_steps=critic_train_states.grad_steps + 1
+                    )
                     new_encoder_train_states = encoder_train_states.replace(
                         params=optax.apply_updates(encoder_train_states.params, encoder_updates),
                         opt_state=new_encoder_opt_state,
@@ -756,12 +768,34 @@ def make_train(config):
             mean_kls = jnp.mean(kls, axis=0)
             env_metrics = compute_agent_metrics(infos, config)
 
+            num_agents = config["NUM_AGENTS"]
+            num_steps  = config["NUM_STEPS"]
+            num_envs   = config["NUM_ENVS"]
+            test_envs  = config.get("TEST_ENVS", 0)
+            envs_per_agent = num_envs + test_envs
+
+            v = infos["returned_episode_returns"]      # (T, total_envs)
+            m = infos["returned_episode"]              # (T, total_envs) in {0,1}
+
+            v_e = jnp.transpose(v, (1, 0)).reshape((num_agents, envs_per_agent, num_steps))
+            m_e = jnp.transpose(m, (1, 0)).reshape((num_agents, envs_per_agent, num_steps))
+
+            v_tr = jnp.transpose(v_e[:, :num_envs], (2, 0, 1))   # (T, A, num_envs)
+            m_tr = jnp.transpose(m_e[:, :num_envs], (2, 0, 1))   # (T, A, num_envs)
+
+            num = jnp.sum(v_tr * m_tr, axis=(0, 2))
+            den = jnp.maximum(jnp.sum(m_tr,        axis=(0, 2)), 1.0)
+            train_raw_returns = num / den         
+
+            train_norm_returns = (train_raw_returns - score_min) / score_denom
             ema_target = env_metrics["normalized_returned_episode_returns"] 
             critic_train_states = critic_train_states.replace(
-                ema_return = _update_ema(critic_train_states.ema_return, ema_target, config["EMA_ALPHA"])
+                ema_return = _update_ema(critic_train_states.ema_return, ema_target, config["EMA_ALPHA"]),
+                ema_train_return = _update_ema(critic_train_states.ema_train_return, train_norm_returns, config["EMA_ALPHA"])
             )
             actor_train_states  = actor_train_states.replace(
-                ema_return = critic_train_states.ema_return
+                ema_return = critic_train_states.ema_return,
+                ema_train_return = critic_train_states.ema_train_return
             )
             critic_train_states = critic_train_states.replace(mix_counter = critic_train_states.mix_counter + 1)
             actor_train_states  = actor_train_states.replace(mix_counter  = actor_train_states.mix_counter  + 1)
@@ -782,24 +816,14 @@ def make_train(config):
                 A   = config["NUM_AGENTS"]
                 tau = config.get("MIX_TAU", 2.0)
 
-                w = jax.nn.softmax(critic_train_states.ema_return / tau)   # shape (A,)
+                w = jax.nn.softmax(critic_train_states.ema_train_return / tau)   # shape (A,)
                 # w = jax.nn.softmax(jnp.ones(A,))
 
-                merged_critic = _merge_params(critic_train_states.params,  w)
                 merged_actor  = _merge_params(actor_train_states.params,   w)
-
-                critic_pack = _repeat_pytree(merged_critic, A)
                 actor_pack  = _repeat_pytree(merged_actor,  A)
 
                 def _reset_opt(ts: TrainState):
                     return ts.replace(opt_state = ts.tx.init(ts.params))
-
-                new_critic_states = jax.vmap(_reset_opt)(
-                    critic_train_states.replace(
-                        params      = critic_pack,
-                        mix_counter = jnp.zeros_like(critic_train_states.mix_counter),
-                    )
-                )
 
                 new_actor_states  = jax.vmap(_reset_opt)(
                     actor_train_states.replace(
@@ -808,25 +832,27 @@ def make_train(config):
                     )
                 )
 
-                return new_critic_states, new_actor_states
+                return new_actor_states
 
             def _skip_states(_):
-                return critic_train_states, actor_train_states
+                return actor_train_states
 
-            critic_train_states, actor_train_states = jax.lax.cond(
+            actor_train_states = jax.lax.cond(
                 do_mix, _mix_states, _skip_states, operand=None
             )
             tau = config.get("MIX_TAU", 2.0)
-            mix_w = jax.nn.softmax(critic_train_states.ema_return / tau)
+            mix_w = jax.nn.softmax(actor_train_states.ema_train_return / tau)
 
             metrics = {}
             for i in range(config["NUM_AGENTS"]):
+                metrics[f"agent_{i}/train_return"] = train_raw_returns[i]
                 metrics[f"agent_{i}/mix_weight_from_ema"] = mix_w[i]
-                metrics[f"agent_{i}/ema_return"] = critic_train_states.ema_return[i]
-                metrics[f"agent_{i}/env_step"] = critic_train_states.timesteps[i]
-                metrics[f"agent_{i}/update_steps"] = critic_train_states.n_updates[i]
-                metrics[f"agent_{i}/env_frame"] = critic_train_states.timesteps[i] * env.single_observation_space.shape[0]
-                metrics[f"agent_{i}/grad_steps"] = critic_train_states.grad_steps[i]
+                metrics[f"agent_{i}/ema_return"] = actor_train_states.ema_return[i]
+                metrics[f"agent_{i}/ema_train_return"] = actor_train_states.ema_train_return[i]
+                metrics[f"agent_{i}/env_step"] = actor_train_states.timesteps[i]
+                metrics[f"agent_{i}/update_steps"] = actor_train_states.n_updates[i]
+                metrics[f"agent_{i}/env_frame"] = actor_train_states.timesteps[i] * env.single_observation_space.shape[0]
+                metrics[f"agent_{i}/grad_steps"] = actor_train_states.grad_steps[i]
                 metrics[f"agent_{i}/td_loss"] = mean_critic_losses[i]
                 metrics[f"agent_{i}/policy_loss"] = mean_actor_losses[i]
                 metrics[f"agent_{i}/entropy"] = mean_entropies[i]
