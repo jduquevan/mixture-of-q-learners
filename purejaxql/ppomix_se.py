@@ -103,10 +103,11 @@ class LogEnvState:
     episode_lengths: jnp.array
     returned_episode_returns: jnp.array
     returned_episode_lengths: jnp.array
+    fire_countdown: jnp.array
 
 
 class JaxLogEnvPoolWrapper(gym.Wrapper):
-    def __init__(self, env, reset_info=True, async_mode=True):
+    def __init__(self, env, reset_info=True, async_mode=True, force_fire_on_reset=True, fire_action=1, fire_steps=1):
         super(JaxLogEnvPoolWrapper, self).__init__(env)
         self.num_envs = getattr(env, "num_envs", 1)
         self.env_name = env.name
@@ -119,6 +120,11 @@ class JaxLogEnvPoolWrapper(gym.Wrapper):
             self.has_lives = True
             print("env has lives")
         self.reset_info = reset_info
+        
+        self.force_fire_on_reset = force_fire_on_reset
+        self.fire_action = int(fire_action)
+        self.fire_steps = int(fire_steps)
+
         handle, recv, send, step = env.xla()
         self.init_handle = handle
         self.send_f = send
@@ -135,17 +141,35 @@ class JaxLogEnvPoolWrapper(gym.Wrapper):
             jnp.zeros(self.num_envs, dtype=jnp.float32),
             jnp.zeros(self.num_envs, dtype=jnp.float32),
             jnp.zeros(self.num_envs, dtype=jnp.float32),
-        )
+            jnp.full((self.num_envs,), self.fire_steps, dtype=jnp.int32)
+            if self.force_fire_on_reset else
+            jnp.zeros((self.num_envs,), dtype=jnp.int32),)
         return observations, env_state
 
     @partial(jax.jit, static_argnums=(0,))
     def step(self, state, action):
+        if self.force_fire_on_reset:
+            fa = jnp.asarray(self.fire_action, dtype=action.dtype)
+            override = state.fire_countdown > 0    
+            action = jnp.where(override, fa, action)
+
         new_handle, (observations, rewards, dones, infos) = self.step_f(
             state.handle, action
         )
 
         new_episode_return = state.episode_returns + infos["reward"]
         new_episode_length = state.episode_lengths + 1
+        terminated = infos["terminated"] + infos["TimeLimit.truncated"]
+
+        if self.force_fire_on_reset:
+            next_fire = jnp.where(
+                terminated.astype(jnp.bool_),
+                jnp.asarray(self.fire_steps, dtype=jnp.int32),
+                jnp.maximum(state.fire_countdown - 1, 0),
+            )
+        else:
+            next_fire = state.fire_countdown
+
         state = state.replace(
             handle=new_handle,
             episode_returns=(new_episode_return)
@@ -164,11 +188,11 @@ class JaxLogEnvPoolWrapper(gym.Wrapper):
                 new_episode_length,
                 state.returned_episode_lengths,
             ),
+            fire_countdown=next_fire,
         )
 
         if self.reset_info:
             elapsed_steps = infos["elapsed_step"]
-            terminated = infos["terminated"] + infos["TimeLimit.truncated"]
             infos = {}
         normalize_score = lambda x: (x - self.env_random_score) / (
             self.env_human_score - self.env_random_score
@@ -600,10 +624,6 @@ def make_train(config):
                 gamma    = config["GAMMA"],
                 lam      = config["LAMBDA"],
             )
-            def _norm_adv_per_agent_batch(adv_mb: jnp.ndarray) -> jnp.ndarray:
-                mean = adv_mb.mean(axis=1, keepdims=True)
-                std  = adv_mb.std(axis=1, keepdims=True) + 1e-8
-                return (adv_mb - mean) / std
             
             gae_advantages = (gae_advantages - gae_advantages.mean()) / (gae_advantages.std() + 1e-8)
             
@@ -616,7 +636,6 @@ def make_train(config):
                 targets = jax.tree_util.tree_map(lambda x: jnp.swapaxes(x, 0, 1), targets)
                 advantages = jax.tree_map(lambda x: preprocess_transitions_per_agent(x, _rng, config), gae_advantages)
                 advantages = jax.tree_util.tree_map(lambda x: jnp.swapaxes(x, 0, 1), advantages)
-                # advantages = jax.vmap(_norm_adv_per_agent_batch, in_axes=0)(advantages)
 
                 def _learn_phase(carry, minibatch_and_target):
                     critic_train_states, actor_train_states, encoder_train_states, rng = carry
@@ -665,10 +684,6 @@ def make_train(config):
                         critic_loss, grads = jax.value_and_grad(_critic_loss_fn, argnums=(0, 1))(cts.params, ets.params)
                         critic_grad = grads[0]
                         encoder_c_grad = grads[1]
-                        
-                        # critic_updates, new_critic_opt_state = cts.tx.update(grads[0], cts.opt_state, cts.params)
-                        # new_critic_params = optax.apply_updates(cts.params, critic_updates)
-                        # cts = cts.replace(params=new_critic_params, opt_state=new_critic_opt_state, grad_steps=cts.grad_steps+1)
 
                         # Actor loss and update
                         def _actor_loss_fn(actor_params, encoder_params):
@@ -784,10 +799,13 @@ def make_train(config):
             m_tr = jnp.transpose(m_e[:, :num_envs], (2, 0, 1))   # (T, A, num_envs)
 
             num = jnp.sum(v_tr * m_tr, axis=(0, 2))
-            den = jnp.maximum(jnp.sum(m_tr,        axis=(0, 2)), 1.0)
+            den = jnp.maximum(jnp.sum(m_tr, axis=(0, 2)), 1.0)
+            has_eps = den > 0
             train_raw_returns = num / den         
 
             train_norm_returns = (train_raw_returns - score_min) / score_denom
+            train_norm_returns = jnp.where(has_eps, train_norm_returns, critic_train_states.ema_train_return)
+
             ema_target = env_metrics["normalized_returned_episode_returns"] 
             critic_train_states = critic_train_states.replace(
                 ema_return = _update_ema(critic_train_states.ema_return, ema_target, config["EMA_ALPHA"]),
@@ -806,6 +824,17 @@ def make_train(config):
                     stacked_params,
                 )
 
+            def _merge_tree_weighted(stacked_tree, w):
+                def merge_leaf(x):
+                    if jnp.issubdtype(x.dtype, jnp.floating):
+                        return jnp.tensordot(w, x, axes=1)   # weighted avg of EMA-like floats
+                    elif jnp.issubdtype(x.dtype, jnp.integer):
+                        return jnp.max(x, axis=0)            # step counters etc.
+                    else:
+                        return x[0]                          # e.g., bools or objects
+                return jax.tree_util.tree_map(merge_leaf, stacked_tree)
+
+
             def _repeat_pytree(tree, n):
                 """Return a PyTree whose leaves are stacked copies of t along new axis 0."""
                 return jax.tree_util.tree_map(lambda x: jnp.stack([x] * n, axis=0), tree)
@@ -820,18 +849,27 @@ def make_train(config):
                 # w = jax.nn.softmax(jnp.ones(A,))
 
                 merged_actor  = _merge_params(actor_train_states.params,   w)
+                merged_actor_opt = _merge_tree_weighted(actor_train_states.opt_state, w)
+
                 actor_pack  = _repeat_pytree(merged_actor,  A)
+                actor_pack_opt    = _repeat_pytree(merged_actor_opt,    config["NUM_AGENTS"])
 
-                def _reset_opt(ts: TrainState):
-                    return ts.replace(opt_state = ts.tx.init(ts.params))
+                # def _reset_opt(ts: TrainState):
+                #     return ts.replace(opt_state = ts.tx.init(ts.params))
 
-                new_actor_states  = jax.vmap(_reset_opt)(
-                    actor_train_states.replace(
-                        params      = actor_pack,
-                        mix_counter = jnp.zeros_like(actor_train_states.mix_counter),
-                    )
+                # new_actor_states  = jax.vmap(_reset_opt)(
+                #     actor_train_states.replace(
+                #         params      = actor_pack,
+                #         opt_state   = actor_pack_opt,
+                #         mix_counter = jnp.zeros_like(actor_train_states.mix_counter),
+                #     )
+                # )
+
+                new_actor_states =  actor_train_states.replace(
+                    params      = actor_pack,
+                    opt_state   = actor_pack_opt,
+                    mix_counter = jnp.zeros_like(actor_train_states.mix_counter),
                 )
-
                 return new_actor_states
 
             def _skip_states(_):
