@@ -664,8 +664,9 @@ def make_train(config):
                     logprobs_all = jax.lax.stop_gradient(logprobs_all)
 
                     div_coef = config.get("DIVERSITY_COEFF", 0.0) * (A > 1)
+                    cross_entropy_mask = jnp.tril(jnp.ones((A, A)))
 
-                    def agent_loss_and_update(cts, ats, minibatch, target, ets, logprobs_all, adv_i, i):
+                    def agent_loss_and_update(cts, ats, minibatch, target, ets, logprobs_all, adv_i, i, ce_mask):
                         # Critic loss and update
                         def _critic_loss_fn(critic_params, encoder_params):
                             features = network.apply(
@@ -710,20 +711,22 @@ def make_train(config):
                             ent_loss = -jnp.mean(entropy)
                             ent_coeff = config["ENT_COEFF"]
 
-                            # Exempt always 1 agent (base policy)
-                            is_exempt = (i == 0)
+                            # is_exempt = (i == 0)
                             logits_div = network.apply({"params": actor_params},
                                        div_feats, train=True, method=ActorCritic.actor)
                             probs_div, logprobs_div, _ = _policy_from_logits(logits_div)  # [S,Act]
 
-                            sum_logp_others  = jnp.sum(logprobs_all, axis=0) - logprobs_all[i]
-                            mean_logp_others = sum_logp_others / jnp.maximum(1, A - 1)
+                            w = ce_mask.astype(logprobs_all.dtype)
+                            w = w * (1.0 - jax.nn.one_hot(i, w.shape[0], dtype=w.dtype))
+                            sum_w = jnp.sum(w)
+                            denom = jnp.maximum(sum_w, 1.0)
+
+                            mean_logp_others = (w[:, None, None] * logprobs_all).sum(axis=0) / denom
                             ce_mean = -jnp.mean(jnp.sum(probs_div * mean_logp_others, axis=-1))
 
+                            # div_coef_i = jnp.where(is_exempt, 0.0, div_coef)
 
-                            div_coef_i = jnp.where(is_exempt, 0.0, div_coef)
-
-                            loss = pg_loss + ent_coeff * ent_loss - div_coef_i * ce_mean
+                            loss = pg_loss + ent_coeff * ent_loss - div_coef * ce_mean
                             aux  = {"entropy": jnp.mean(entropy), "kl": ce_mean}
                             return loss, aux
 
@@ -738,8 +741,8 @@ def make_train(config):
                         
                         return critic_loss, actor_loss, entropies, kl, ats, critic_grad, encoder_c_grad, encoder_a_grad
                     
-                    critic_loss, actor_loss, entropies, kls, new_actor_train_states, critic_grads, encoder_c_grad, encoder_a_grad = jax.vmap(agent_loss_and_update, in_axes=(None, 0,0,0, None, None,0,0))(
-                        critic_train_states, actor_train_states, minibatch, target, encoder_train_states, logprobs_all, advantage, agent_ids
+                    critic_loss, actor_loss, entropies, kls, new_actor_train_states, critic_grads, encoder_c_grad, encoder_a_grad = jax.vmap(agent_loss_and_update, in_axes=(None, 0,0,0, None, None,0,0,0))(
+                        critic_train_states, actor_train_states, minibatch, target, encoder_train_states, logprobs_all, advantage, agent_ids, cross_entropy_mask
                     )
 
                     def mean_over_agents(tree): return jax.tree_map(lambda x: x.mean(0), tree)
