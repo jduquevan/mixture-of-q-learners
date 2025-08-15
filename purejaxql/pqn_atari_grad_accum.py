@@ -267,6 +267,7 @@ class CustomTrainState(TrainState):
     timesteps: int = 0
     n_updates: int = 0
     grad_steps: int = 0
+    grad_accum_steps: int = 0
     
 def expected_q_eps_greedy(q, eps):
     # q: [B, A]; eps: scalar or [B]
@@ -346,6 +347,12 @@ def make_train(config):
 
     def train(rng):
         original_seed = rng[0]
+        
+        
+        GRAD_ACCUM_STEPS = config["GRAD_ACCUM_STEPS"]
+        def eps_step(ts: CustomTrainState):
+            # slow down epsilon by accum (simplest + matches your ask)
+            return ts.n_updates // GRAD_ACCUM_STEPS
 
         eps_scheduler = optax.linear_schedule(
             config["EPS_START"],
@@ -358,7 +365,7 @@ def make_train(config):
             end_value=1e-20,
             transition_steps=(config["NUM_UPDATES_DECAY"])
             * config["NUM_MINIBATCHES"]
-            * config["NUM_EPOCHS"],
+            * config["NUM_EPOCHS"] // GRAD_ACCUM_STEPS,
         )
         lr = lr_scheduler if config.get("LR_LINEAR_DECAY", False) else config["LR"]
 
@@ -393,7 +400,7 @@ def make_train(config):
 
         # TRAINING LOOP
         def _update_step(runner_state, unused):
-            train_state, expl_state, test_metrics, rng = runner_state
+            train_state, expl_state, test_metrics, rng, accumulated_grads = runner_state
 
             # SAMPLE PHASE
             def _step_env(carry, _):
@@ -410,7 +417,7 @@ def make_train(config):
 
                 # different eps for each env
                 _rngs = jax.random.split(rng_a, total_envs)
-                eps = jnp.full(config["NUM_ENVS"], eps_scheduler(train_state.n_updates))
+                eps = jnp.full(config["NUM_ENVS"], eps_scheduler(eps_step(train_state)))
                 if config.get("TEST_DURING_TRAINING", False):
                     eps = jnp.concatenate((eps, jnp.zeros(config["TEST_ENVS"])))
                 new_action = jax.vmap(eps_greedy_exploration)(_rngs, q_vals, eps)
@@ -464,7 +471,7 @@ def make_train(config):
             if config["IS_SARSA"] is False:
                 last_q = jnp.max(last_q_vals, axis=-1)
             else:
-                last_q = expected_q_eps_greedy(last_q_vals, eps_scheduler(train_state.n_updates))
+                last_q = expected_q_eps_greedy(last_q_vals, eps_scheduler(eps_step(train_state)))
 
             def _compute_targets(last_q, q_vals, reward, done):
                 def _get_target(lambda_returns_and_next_q, rew_q_done):
@@ -479,14 +486,14 @@ def make_train(config):
                     if config["IS_SARSA"] is False:
                         next_q = jnp.max(q, axis=-1)
                     else:
-                        next_q = expected_q_eps_greedy(q, eps_scheduler(train_state.n_updates))
+                        next_q = expected_q_eps_greedy(q, eps_scheduler(eps_step(train_state)))
                     return (lambda_returns, next_q), lambda_returns
 
                 lambda_returns = reward[-1] + config["GAMMA"] * (1 - done[-1]) * last_q
                 if config["IS_SARSA"] is False:
                     last_q = jnp.max(q_vals[-1], axis=-1)
                 else:
-                    last_q = expected_q_eps_greedy(q_vals[-1], eps_scheduler(train_state.n_updates))
+                    last_q = expected_q_eps_greedy(q_vals[-1], eps_scheduler(eps_step(train_state)))
                 _, targets = jax.lax.scan(
                     _get_target,
                     (lambda_returns, last_q),
@@ -502,10 +509,10 @@ def make_train(config):
 
             # NETWORKS UPDATE
             def _learn_epoch(carry, _):
-                train_state, rng = carry
+                train_state, rng, accumulated_grads = carry
 
                 def _learn_phase(carry, minibatch_and_target):
-                    train_state, rng = carry
+                    train_state, rng, accumulated_grads = carry
                     minibatch, target = minibatch_and_target
 
                     def _loss_fn(params):
@@ -529,12 +536,28 @@ def make_train(config):
                     (loss, (updates, qvals)), grads = jax.value_and_grad(
                         _loss_fn, has_aux=True
                     )(train_state.params)
-                    train_state = train_state.apply_gradients(grads=grads)
+                    accumulated_grads = jax.tree.map(lambda x, y: x + y, accumulated_grads, grads)
+                    
+                    def _apply_step(args):
+                        ts, ga = args
+                        ts = ts.apply_gradients(grads=ga)
+                        ts = ts.replace(grad_steps=ts.grad_steps + 1,
+                                        grad_accum_steps=ts.grad_accum_steps + 1)
+                        return ts, jax.tree.map(lambda x: jnp.zeros_like(x), ga)
+
+                    def _skip(args):
+                        ts, ga = args
+                        ts = ts.replace(grad_accum_steps=ts.grad_accum_steps + 1)
+                        return ts, ga
+
+                    apply_now = jnp.equal(train_state.grad_accum_steps % GRAD_ACCUM_STEPS, 0)
+                    train_state, accumulated_grads = jax.lax.cond(apply_now, _apply_step, _skip, (train_state, accumulated_grads))
+                    
                     train_state = train_state.replace(
-                        grad_steps=train_state.grad_steps + 1,
                         batch_stats=updates["batch_stats"],
                     )
-                    return (train_state, rng), (loss, qvals)
+                    
+                    return (train_state, rng, accumulated_grads), (loss, qvals)
 
                 def preprocess_transition(x, rng):
                     x = x.reshape(
@@ -555,15 +578,15 @@ def make_train(config):
                 )
 
                 rng, _rng = jax.random.split(rng)
-                (train_state, rng), (loss, qvals) = jax.lax.scan(
-                    _learn_phase, (train_state, rng), (minibatches, targets)
+                (train_state, rng, accumulated_grads), (loss, qvals) = jax.lax.scan(
+                    _learn_phase, (train_state, rng, accumulated_grads), (minibatches, targets)
                 )
 
-                return (train_state, rng), (loss, qvals)
+                return (train_state, rng, accumulated_grads), (loss, qvals)
 
             rng, _rng = jax.random.split(rng)
-            (train_state, rng), (loss, qvals) = jax.lax.scan(
-                _learn_epoch, (train_state, rng), None, config["NUM_EPOCHS"]
+            (train_state, rng, accumulated_grads), (loss, qvals) = jax.lax.scan(
+                _learn_epoch, (train_state, rng, accumulated_grads), None, config["NUM_EPOCHS"]
             )
 
             train_state = train_state.replace(n_updates=train_state.n_updates + 1)
@@ -581,6 +604,7 @@ def make_train(config):
                     0
                 ],  # first dimension of the observation space is number of stacked frames
                 "grad_steps": train_state.grad_steps,
+                "grad_accum_steps": train_state.grad_accum_steps,
                 "td_loss": loss.mean(),
                 "qvals": qvals.mean(),
             }
@@ -605,7 +629,7 @@ def make_train(config):
 
                 jax.debug.callback(callback, metrics, original_seed)
 
-            runner_state = (train_state, tuple(expl_state), test_metrics, rng)
+            runner_state = (train_state, tuple(expl_state), test_metrics, rng, accumulated_grads)
 
             return runner_state, metrics
 
@@ -615,7 +639,8 @@ def make_train(config):
         # train
         rng, _rng = jax.random.split(rng)
         expl_state = (init_obs, env_state)
-        runner_state = (train_state, expl_state, test_metrics, _rng)
+        accumulated_grads = jax.tree.map(lambda x: jnp.zeros_like(x), train_state.params)
+        runner_state = (train_state, expl_state, test_metrics, _rng, accumulated_grads)
 
         runner_state, metrics = jax.lax.scan(
             _update_step, runner_state, None, config["NUM_UPDATES"]

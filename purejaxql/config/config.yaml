@@ -13,9 +13,11 @@ HYP_TUNE: False
 DEBUG: False
 
 # wandb params
+RUN_ID: "test"
 WANDB_MODE: "online"  # set to online to activate wandb
 ENTITY: "puredip"
 PROJECT: "Mixture-of-Q-learners"
+WANDB_TAGS: ['test',]
 alg:
   WANDB_LOG_ALL_SEEDS: False # will log all the vmapped seeds separetely
 

@@ -19,5 +19,11 @@ purejaxql/.schemas
 load_env.sh
 pyproject.toml
 uv.lock
+slurmout/
+*.mp4
+results/
+*.gif
+slurm-*.out
+sweep_temp_job.sh
 
 
