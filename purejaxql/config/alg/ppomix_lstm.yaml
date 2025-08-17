@@ -2,7 +2,7 @@ ALG_NAME: "ppomix"
 TOTAL_TIMESTEPS: 5e9 # with 4 frame skip correpsnds to 200M frames
 TOTAL_TIMESTEPS_DECAY: 5e9 # will be used for decay functions (epsilon and lr)
 NUM_ENVS: 128 # parallel environments
-NUM_STEPS: 32 # steps per environment in each update
+NUM_STEPS: 128 # steps per environment in each update
 NUM_EPOCHS: 2 # number of epochs per update
 NUM_MINIBATCHES: 32 # minibatches per epoch
 NORM_TYPE: "layer_norm" # layer_norm or batch_norm
@@ -18,7 +18,8 @@ HIDDEN_SIZE: 256
 
 # mixing
 MIXING_STEPS: 5000000            # every N PPO updates do a weighted merge
-EMA_ALPHA: 0.05 
+EMA_ALPHA: 0.05
+BPTT_LEN: 128
 
 # env specific, see https://envpool.readthedocs.io/en/latest/env/atari.html
 ENV_NAME: "Pong-v5"
