@@ -260,6 +260,8 @@ class Transition:
     done: chex.Array
     next_obs: chex.Array
     q_val: chex.Array
+    gallery_reward: chex.Array
+    original_reward: chex.Array
 
 
 class CustomTrainState(TrainState):
@@ -390,14 +392,22 @@ def make_train(config):
 
         rng, _rng = jax.random.split(rng)
         train_state = create_agent(rng)
-
+        
+        if config["TEST_DURING_TRAINING"]:
+            NUM_TOTAL_ENVS = config["NUM_ENVS"] + config["TEST_ENVS"]
+        else:
+            NUM_TOTAL_ENVS = config["NUM_ENVS"]
+        
+        gallery_obs = jnp.zeros((NUM_TOTAL_ENVS, config["GALLERY_DEPTH"],*env.observation_space.shape))
+        gallery_counter = jnp.zeros((NUM_TOTAL_ENVS,), dtype=jnp.int32)
+        
         # TRAINING LOOP
         def _update_step(runner_state, unused):
-            train_state, expl_state, test_metrics, rng = runner_state
+            train_state, expl_state, test_metrics, rng, (gallery_obs, gallery_counter) = runner_state
 
             # SAMPLE PHASE
             def _step_env(carry, _):
-                last_obs, env_state, rng = carry
+                last_obs, env_state, rng, (gallery_obs, gallery_counter) = carry
                 rng, rng_a, rng_s = jax.random.split(rng, 3)
                 q_vals = network.apply(
                     {
@@ -415,9 +425,33 @@ def make_train(config):
                     eps = jnp.concatenate((eps, jnp.zeros(config["TEST_ENVS"])))
                 new_action = jax.vmap(eps_greedy_exploration)(_rngs, q_vals, eps)
 
-                new_obs, new_env_state, reward, new_done, info = env.step(
+                new_obs, new_env_state, original_reward, new_done, info = env.step(
                     env_state, new_action
                 )
+                
+                gallery_counter = jnp.where(new_done, 0, gallery_counter + 1)
+                gallery_update_index = (gallery_counter // config["GALLERY_UPDATE_FREQ"]) % config["GALLERY_DEPTH"]
+                gallery_should_update = gallery_counter % config["GALLERY_UPDATE_FREQ"] == 0
+                updated_gallery_obs = gallery_obs.at[jnp.arange(NUM_TOTAL_ENVS), gallery_update_index, ...].set(last_obs)
+                gallery_obs = jax.vmap(lambda g, u_g, s: jnp.where(s, u_g, g))(gallery_obs, updated_gallery_obs, gallery_should_update)
+                
+                gallery_valid_index = jnp.minimum(gallery_counter // config["GALLERY_UPDATE_FREQ"], config["GALLERY_DEPTH"] - 1)
+                gallery_valid_mask = jnp.tril(jnp.ones((config["GALLERY_DEPTH"], config["GALLERY_DEPTH"])))[gallery_valid_index]
+                
+                def single_frame_gallery_reward(obs, gallery_obs, mask):
+                    obs = obs / 255.0
+                    gallery_obs = gallery_obs / 255.0
+                    diff = jnp.abs(obs - gallery_obs)
+                    return diff.mean() * mask
+                
+                def whole_gallery_reward(obs, gallery_obs, mask):
+                    gallery_rewards = jax.vmap(lambda g, m: single_frame_gallery_reward(obs, g, m))(gallery_obs, mask)
+                    return gallery_rewards.sum() / mask.sum()
+                
+                gallery_rewards = jax.vmap(whole_gallery_reward)(new_obs, gallery_obs, gallery_valid_mask)
+                
+                reward = original_reward * config.get("REW_SCALE", 1) + gallery_rewards * config["GALLERY_REWARD_SCALE"]
+                    
                 
                 if config["SCALE_FACTOR"] > 1:
                     new_obs = nearest_neighbor_upscale(new_obs, scale_factor=config["SCALE_FACTOR"])
@@ -425,18 +459,20 @@ def make_train(config):
                 transition = Transition(
                     obs=last_obs,
                     action=new_action,
-                    reward=config.get("REW_SCALE", 1) * reward,
+                    reward=reward,
                     done=new_done,
                     next_obs=new_obs,
                     q_val=q_vals,
+                    gallery_reward=gallery_rewards * config["GALLERY_REWARD_SCALE"],
+                    original_reward=original_reward * config.get("REW_SCALE", 1)
                 )
-                return (new_obs, new_env_state, rng), (transition, info)
+                return (new_obs, new_env_state, rng, (gallery_obs, gallery_counter)), (transition, info)
 
             # step the env
             rng, _rng = jax.random.split(rng)
-            (*expl_state, rng), (transitions, infos) = jax.lax.scan(
+            (*expl_state, rng, (gallery_obs, gallery_counter)), (transitions, infos) = jax.lax.scan(
                 _step_env,
-                (*expl_state, _rng),
+                (*expl_state, _rng, (gallery_obs, gallery_counter)),
                 None,
                 config["NUM_STEPS"],
             )
@@ -447,27 +483,6 @@ def make_train(config):
                 transitions = jax.tree.map(
                     lambda x: x[:, : -config["TEST_ENVS"]], transitions
                 )
-                
-            if config["CURIOSITY_REWARD"] == 'MSE_FRAME':
-                mean_frame = jnp.mean(transitions.next_obs, axis=(0, 1, 2)) / 255.0
-                curiosity_reward = jnp.abs(transitions.next_obs / 255.0 - mean_frame).mean(axis=(2, 3, 4))
-                curiosity_reward = (curiosity_reward) / (curiosity_reward.std() + 1e-3)
-                curiosity_reward = curiosity_reward * config["CURIOSITY_REWARD_SCALE"]
-                avg_curiosity_reward = curiosity_reward.mean()
-                std_curiosity_reward = curiosity_reward.std()
-                transitions = transitions.replace(reward=transitions.reward + curiosity_reward)
-            if config["CURIOSITY_REWARD"] == 'MSE_FRAME':
-                mean_frame = jnp.mean(transitions.next_obs, axis=(0, 1, 2)) / 255.0
-                curiosity_reward = jnp.softmax(transitions.q_val, axis=-1)
-                curiosity_reward = (curiosity_reward) / (curiosity_reward.std() + 1e-3)
-                curiosity_reward = curiosity_reward * config["CURIOSITY_REWARD_SCALE"]
-                avg_curiosity_reward = curiosity_reward.mean()
-                std_curiosity_reward = curiosity_reward.std()
-                transitions = transitions.replace(reward=transitions.reward + curiosity_reward)
-            elif config["CURIOSITY_REWARD"] == 'DISABLED':
-                pass
-            else:
-                raise ValueError(f"Invalid curiosity reward type: {config['CURIOSITY_REWARD']}")
 
             train_state = train_state.replace(
                 timesteps=train_state.timesteps
@@ -607,9 +622,17 @@ def make_train(config):
                 "max_reward": transitions.reward.max(),
             }
             
-            if config["CURIOSITY_REWARD"] == 'MSE_FRAME':
-                metrics["curiosity_reward_avg"] = avg_curiosity_reward
-                metrics["curiosity_reward_std"] = std_curiosity_reward
+            metrics["gallery_reward"] = transitions.gallery_reward.mean()
+            metrics["gallery_reward_std"] = transitions.gallery_reward.std()
+            metrics["gallery_reward_max"] = transitions.gallery_reward.max()
+            metrics["gallery_reward_min"] = transitions.gallery_reward.min()
+            metrics["original_reward"] = transitions.original_reward.mean()
+            metrics["original_reward_std"] = transitions.original_reward.std()
+            metrics["original_reward_max"] = transitions.original_reward.max()
+            metrics["original_reward_min"] = transitions.original_reward.min()
+            metrics["reward"] = transitions.reward.mean()
+            metrics["reward_max"] = transitions.reward.max()
+            metrics["reward_min"] = transitions.reward.min()
 
             metrics.update({k: v.mean() for k, v in infos.items()})
             if config.get("TEST_DURING_TRAINING", False):
@@ -631,7 +654,7 @@ def make_train(config):
 
                 jax.debug.callback(callback, metrics, original_seed)
 
-            runner_state = (train_state, tuple(expl_state), test_metrics, rng)
+            runner_state = (train_state, tuple(expl_state), test_metrics, rng, (gallery_obs, gallery_counter))
 
             return runner_state, metrics
 
@@ -641,7 +664,7 @@ def make_train(config):
         # train
         rng, _rng = jax.random.split(rng)
         expl_state = (init_obs, env_state)
-        runner_state = (train_state, expl_state, test_metrics, _rng)
+        runner_state = (train_state, expl_state, test_metrics, _rng, (gallery_obs, gallery_counter))
 
         runner_state, metrics = jax.lax.scan(
             _update_step, runner_state, None, config["NUM_UPDATES"]

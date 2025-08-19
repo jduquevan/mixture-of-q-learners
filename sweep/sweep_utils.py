@@ -5,6 +5,7 @@ import os
 def gen_script(python_command):
     script = (
         "#!/bin/bash\n"
+        
         "source ./load_env.sh\n"
         f"{python_command}"
     )
@@ -12,7 +13,7 @@ def gen_script(python_command):
 
 def get_compute_command(compute_type: str = "l40s", job_name: str = 'meltingpot_default', dependency_job_id: str = None):
     if compute_type == "l40s":
-        base =  'sbatch  --time=12:0:0  --gres=gpu:l40s:1 --partition=long --cpus-per-task=12 --mem=64G'
+        base =  'sbatch  --time=48:0:0  --gres=gpu:l40s:1 --partition=long --cpus-per-task=24 --mem=64G'
     elif compute_type == "a100l":
         base = 'sbatch  --time=48:0:0  --gres=gpu:a100l:1 --partition=long --cpus-per-task=24 --mem=64G'
     elif compute_type == "a100l_unkillable":

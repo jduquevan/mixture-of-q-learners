@@ -1,49 +1,61 @@
 from sweep_utils import submit_slurm_job, get_compute_command
 ### Jobs ###
-BASE_RUN_ID = "20250805_pqn_highres"
-BASE_PYTHON_COMMAND = "python purejaxql/pqn_atari.py" \
+BASE_RUN_ID = "20250818_pitfall_gallery"
+BASE_PYTHON_COMMAND = "python purejaxql/pqn_atari_gallery.py" \
             " RUN_ID={run_id}" \
             " WANDB_TAGS={wandb_tags}" \
             " SEED={seed}" \
             " cluster@_global_={cluster}" \
-            " alg=pqn_atari" \
-            " alg.ENV_NAME={env_name}" \
+            " alg=pqn_atari_gallery" \
+            " alg.ENV_NAME=Pitfall-v5" \
             " alg.NUM_ENVS={num_envs}" \
             " +alg.ENV_KWARGS.img_width={img_width}" \
             " +alg.ENV_KWARGS.img_height={img_height}" \
             " alg.TOTAL_TIMESTEPS={total_timesteps}" \
             " alg.EPS_FINISH={eps_finish}" \
-            " alg.IS_SARSA=False" \
+            " alg.IS_SARSA=True" \
+            " alg.REW_SCALE={rew_scale}" \
+            " alg.ENV_KWARGS.episodic_life={episodic_life}" \
+            " alg.ENV_KWARGS.reward_clip={reward_clip}" \
+            " alg.GALLERY_DEPTH={gallery_depth}" \
+            " alg.GALLERY_UPDATE_FREQ={gallery_update_freq}" \
+            " alg.GALLERY_REWARD_SCALE={gallery_reward_scale}" \
                 
-def get_job(env_name: str,
-            num_envs: int,
+def get_job(num_envs: int,
             img_size: int,
             total_timesteps: int,
-            eps_finish: float):
+            eps_finish: float,
+            rew_scale: float,
+            episodic_life: bool,
+            reward_clip: bool,
+            gallery_depth: int,
+            gallery_update_freq: int,
+            gallery_reward_scale: float):
     
     python_command = BASE_PYTHON_COMMAND
     python_kwargs = {
-        'env_name': env_name,
         'num_envs': num_envs,
         'img_width': img_size,
         'img_height': img_size,
         'total_timesteps': total_timesteps,
         'eps_finish': eps_finish,
+        'rew_scale': rew_scale,
+        'episodic_life': episodic_life,
+        'reward_clip': reward_clip,
+        'gallery_depth': gallery_depth,
+        'gallery_update_freq': gallery_update_freq,
+        'gallery_reward_scale': gallery_reward_scale,
     }
     return python_command, python_kwargs
 
 def get_jobs():
     jobs = {
-        'battle_zone_pqn_atari_84x84_512envs': get_job(env_name='BattleZone-v5', num_envs=512, img_size=84, total_timesteps=25e7, eps_finish=0.001),
-        'battle_zone_pqn_atari_400x400_512envs': get_job(env_name='BattleZone-v5', num_envs=512, img_size=400, total_timesteps=25e7, eps_finish=0.001),
-        'double_dunk_pqn_atari_84x84_512envs': get_job(env_name='DoubleDunk-v5', num_envs=512, img_size=84, total_timesteps=25e7, eps_finish=0.001),
-        'double_dunk_pqn_atari_400x400_512envs': get_job(env_name='DoubleDunk-v5', num_envs=512, img_size=400, total_timesteps=25e7, eps_finish=0.001),
-        'montezuma_pqn_atari_400x400_512envs_0136eps': get_job(env_name='MontezumaRevenge-v5', num_envs=512, img_size=400, total_timesteps=25e7, eps_finish=0.0136),
-        'pitfall_pqn_atari_400x400_512envs_0136eps': get_job(env_name='Pitfall-v5', num_envs=512, img_size=400, total_timesteps=25e7, eps_finish=0.0136),
-        'pitfall_pqn_atari_400x400_512envs_0001eps': get_job(env_name='Pitfall-v5', num_envs=512, img_size=400, total_timesteps=25e7, eps_finish=0.001),
-        'qbert_pqn_atari_400x400_512envs': get_job(env_name='Qbert-v5', num_envs=512, img_size=400, total_timesteps=25e7, eps_finish=0.001),
-        'namethisgame_pqn_atari_400x400_512envs': get_job(env_name='NameThisGame-v5', num_envs=512, img_size=400, total_timesteps=25e7, eps_finish=0.001),
-        'phoenix_pqn_atari_400x400_512envs': get_job(env_name='Phoenix-v5', num_envs=512, img_size=400, total_timesteps=25e7, eps_finish=0.001),
+        'gallery_GF20_GDEPTH100_GS10': get_job(num_envs=512, img_size=160, total_timesteps=25e7, eps_finish=0.01,rew_scale=0.001,
+                                               episodic_life=False, reward_clip=False, gallery_depth=100, gallery_update_freq=20, gallery_reward_scale=10.0),
+        'gallery_GF20_GDEPTH100_GS1': get_job(num_envs=512, img_size=160, total_timesteps=25e7, eps_finish=0.01,rew_scale=0.001,
+                                               episodic_life=False, reward_clip=False, gallery_depth=100, gallery_update_freq=20, gallery_reward_scale=1.0),
+        'gallery_GF20_GDEPTH100_GS100': get_job(num_envs=512, img_size=160, total_timesteps=25e7, eps_finish=0.01,rew_scale=0.001,
+                                               episodic_life=False, reward_clip=False, gallery_depth=100, gallery_update_freq=20, gallery_reward_scale=100.0),
     }
     
     return jobs
@@ -58,6 +70,7 @@ def submit_job(job_names: str | list[str], seeds: list[int], cluster: str = 'mil
     
     for seed in seeds: # I iterate over seeds first, because I rather have one seed of multiple jobs than multiple seeds of one job
         for job_name in job_names:
+            print(f'Submitting job: {job_name}')
             python_command, python_kwargs = jobs[job_name]
             python_kwargs['seed'] = seed
             python_kwargs['run_id'] = f'{BASE_RUN_ID}_{job_name}_{seed}'
