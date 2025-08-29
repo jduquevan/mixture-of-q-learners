@@ -41,9 +41,9 @@ CMD="CUDA_VISIBLE_DEVICES=0 python ppomix_lstm.py \
     alg.ENT_COEFF=${ENT} \
     alg.NUM_ENVS=512 \
     alg.NUM_AGENTS=1 \
-    alg.NUM_STEPS=64 \
+    alg.NUM_STEPS=32 \
     alg.MIXING_STEPS=99999999 \
-    alg.ENV_NAME=Pitfall-v5"
+    alg.ENV_NAME=MontezumaRevenge-v5"
 
 # Print the full command for debugging
 stdbuf -o0 echo "Executing command: $CMD"
