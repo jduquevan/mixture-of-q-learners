@@ -1,7 +1,7 @@
 ALG_NAME: "pqn"
 TOTAL_TIMESTEPS: 5e7 # with 4 frame skip correpsnds to 200M frames
 TOTAL_TIMESTEPS_DECAY: 5e7 # will be used for decay functions (epsilon and lr)
-NUM_ENVS: 128 # parallel environments
+NUM_ENVS: 512 # parallel environments
 NUM_STEPS: 32 # steps per environment in each update
 EPS_START: 1.
 EPS_FINISH: 0.001
@@ -31,7 +31,7 @@ TEST_ENVS: 8
 EPS_TEST: 0. # 0 for greedy test policy
 CURIOSITY_REWARD: "DISABLED"
 CURIOSITY_REWARD_SCALE: 10000000.0 # so it totally messes training if enabled wrongly
-REW_SCALE: 0.001
+REW_SCALE: 1
 SCALE_FACTOR: 1
 IS_SARSA: False
 GRAD_ACCUM_STEPS: 1

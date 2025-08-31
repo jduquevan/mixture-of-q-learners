@@ -539,9 +539,15 @@ def make_train(config):
                 timesteps=train_state.timesteps
                 + config["NUM_STEPS"] * config["NUM_ENVS"]
             )  # update timesteps count
-            
-            last_c = rnn_state.c[: -config["TEST_ENVS"], :]
-            last_h = rnn_state.h[: -config["TEST_ENVS"], :]
+
+            rnn_T = expl_state[2]  # RNN state AFTER T environment steps
+            if config.get("TEST_DURING_TRAINING", False) and config["TEST_ENVS"] > 0:
+                last_c = rnn_T.c[: -config["TEST_ENVS"], :]
+                last_h = rnn_T.h[: -config["TEST_ENVS"], :]
+            else:
+                last_c = rnn_T.c
+                last_h = rnn_T.h
+
             last_q_vals, (_, _) = network.apply(
                 {
                     "params": train_state.params,
