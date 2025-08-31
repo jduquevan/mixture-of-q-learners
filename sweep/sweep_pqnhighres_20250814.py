@@ -1,6 +1,6 @@
 from sweep_utils import submit_slurm_job, get_compute_command
 ### Jobs ###
-BASE_RUN_ID = "20250805_pqn_highres"
+BASE_RUN_ID = "20250805_pqn_highres_fixedrewscale"
 BASE_PYTHON_COMMAND = "python purejaxql/pqn_atari.py" \
             " RUN_ID={run_id}" \
             " WANDB_TAGS={wandb_tags}" \
@@ -44,6 +44,8 @@ def get_jobs():
         'qbert_pqn_atari_400x400_512envs': get_job(env_name='Qbert-v5', num_envs=512, img_size=400, total_timesteps=25e7, eps_finish=0.001),
         'namethisgame_pqn_atari_400x400_512envs': get_job(env_name='NameThisGame-v5', num_envs=512, img_size=400, total_timesteps=25e7, eps_finish=0.001),
         'phoenix_pqn_atari_400x400_512envs': get_job(env_name='Phoenix-v5', num_envs=512, img_size=400, total_timesteps=25e7, eps_finish=0.001),
+        'skiing_pqn_atari_400x400_512envs_higheps': get_job(env_name='Skiing-v5', num_envs=512, img_size=400, total_timesteps=25e7, eps_finish=0.01),
+        'solaris_pqn_atari_400x400_512envs_higheps': get_job(env_name='Solaris-v5', num_envs=512, img_size=400, total_timesteps=25e7, eps_finish=0.01),
     }
     
     return jobs

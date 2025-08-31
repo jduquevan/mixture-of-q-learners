@@ -10,7 +10,9 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from functools import partial
-from typing import Any
+from typing import Any, Optional, Union, Callable
+from chex import Array, Scalar
+from typing_extensions import Self
 
 from flax import struct
 import chex
@@ -27,9 +29,224 @@ import gym
 import numpy as np
 from packaging import version
 from functools import partial
+import functools
 
 is_legacy_gym = version.parse(gym.__version__) < version.parse("0.26.0")
 assert is_legacy_gym, "Current version supports only gym<=0.23.1"
+MetricFn = Callable[[Array, Array], Array]
+
+# code for the episodic intrinsic reward computation is taken from https://github.com/google-deepmind/rlax/blob/master/rlax/_src/exploration.py#L155#L300 and 
+# https://github.com/google-deepmind/rlax/blob/master/rlax/_src/episodic_memory.py
+@chex.dataclass
+class KNNQueryResult():
+  neighbors: jnp.ndarray
+  neighbor_indices: jnp.ndarray
+  neighbor_neg_distances: jnp.ndarray
+
+
+def _sqeuclidian(x: Array, y: Array) -> Array:
+  return jnp.sum(jnp.square(x - y))
+
+
+def _cdist(a: Array, b: Array, metric: MetricFn) -> Array:
+  """Returns the distance between each pair of the two collections of inputs."""
+  return jax.vmap(jax.vmap(metric, (None, 0)), (0, None))(a, b)
+
+
+def knn_query(
+    data: Array,
+    query_points: Array,
+    num_neighbors: int,
+    metric: MetricFn = _sqeuclidian,
+) -> KNNQueryResult:
+  """Finds closest neighbors in data to the query points & their neg distances.
+
+  NOTE: For this function to be jittable, static_argnums=[2,] must be passed, as
+  the internal jax.lax.top_k(neg_distances, num_neighbors) computation cannot be
+  jitted with a dynamic num_neighbors that is passed as an argument.
+
+  Args:
+    data: array of existing data points (elements in database x feature size)
+    query_points: array of points to find neighbors of
+        (num query points x feature size).
+    num_neighbors: number of neighbors to find.
+    metric: Metric to use in calculating distance between two points.
+
+  Returns:
+    KNNQueryResult with (all sorted by neg distance):
+      - neighbors (num query points x num neighbors x feature size)
+      - neighbor_indices (num query points x num neighbors)
+      - neighbor_neg_distances (num query points x num neighbors)
+   * if num_neighbors is greater than number of elements in the database,
+     just return KNNQueryResult with the number of elements in the database.
+  """
+  chex.assert_rank([data, query_points], 2)
+  assert data.shape[-1] == query_points.shape[-1]
+  distance_fn = jax.jit(functools.partial(_cdist, metric=metric))
+  neg_distances = -distance_fn(query_points, data)
+  neg_distances, indices = jax.lax.top_k(
+      neg_distances, k=min(num_neighbors, data.shape[0]))
+  # Batch index into data using indices shaped [num queries, num neighbors]
+  neighbors = jax.vmap(lambda d, i: d[i], (None, 0))(jnp.array(data), indices)
+  return KNNQueryResult(neighbors=neighbors, neighbor_indices=indices,
+                        neighbor_neg_distances=neg_distances)
+
+
+@chex.dataclass
+class IntrinsicRewardState():
+  memory: jnp.ndarray
+  next_memory_index: Scalar = 0
+  distance_sum: Union[Array, Scalar] = 0
+  distance_count: Scalar = 0
+
+
+def episodic_memory_intrinsic_rewards(
+    embeddings: Array,
+    num_neighbors: int,
+    reward_scale: float,
+    intrinsic_reward_state: Optional[IntrinsicRewardState] = None,
+    constant: float = 1e-3,
+    epsilon: float = 1e-4,
+    cluster_distance: float = 8e-3,
+    max_similarity: float = 8.,
+    max_memory_size: int = 30_000):
+  """Compute intrinsic rewards for exploration via episodic memory.
+
+  This method is adopted from the intrinsic reward computation used in "Never
+  Give Up: Learning Directed Exploration Strategies" by Puigdomènech Badia et
+  al., (2020) (https://arxiv.org/abs/2003.13350) and "Agent57: Outperforming the
+  Atari Human Benchmark" by Puigdomènech Badia et al., (2020)
+  (https://arxiv.org/abs/2002.06038).
+
+  From an embedding, we compute the intra-episode intrinsic reward with respect
+  to a pre-existing set of embeddings.
+
+  NOTE: For this function to be jittable, static_argnums=[1,] must be passed, as
+  the internal jax.lax.top_k(neg_distances, num_neighbors) computation in
+  knn_query cannot be jitted with a dynamic num_neighbors that is passed as an
+  argument.
+
+  Args:
+    embeddings: Array, shaped [M, D] for number of new state embeddings M and
+      feature dim D.
+    num_neighbors: int for K neighbors used in kNN query
+    reward_scale: The β term used in the Agent57 paper to scale the reward.
+    intrinsic_reward_state: An IntrinsicRewardState namedtuple, containing
+      memory, next_memory_index, distance_sum, and distance_count.
+      NOTE- On (only) the first call to episodic_memory_intrinsic_rewards, the
+      intrinsic_reward_state is optional, if None is given, an
+      IntrinsicRewardState will be initialized with default parameters,
+      specifically, the memory will be initialized to an array of jnp.inf of
+      shape [max_memory_size x feature dim D], and default values of 0 will be
+      provided for next_memory_index, distance_sum, and distance_count.
+    constant: float; small constant used for numerical stability used during
+      normalizing distances.
+    epsilon: float; small constant used for numerical stability when computing
+      kernel output.
+    cluster_distance: float; the ξ term used in the Agent57 paper to bound the
+      distance rate used in the kernel computation.
+    max_similarity: float; max limit of similarity; used to zero rewards when
+      similarity between memories is too high to be considered 'useful' for an
+      agent.
+    max_memory_size: int; the maximum number of memories to store. Note that
+      performance will be marginally faster if max_memory_size is an exact
+      multiple of M (the number of embeddings to add to memory per call to
+      episodic_memory_intrinsic_reward).
+
+  Returns:
+    Intrinsic reward for each embedding computed by using similarity measure to
+    memories and next IntrinsicRewardState.
+  """
+
+  # Initialize IntrinsicRewardState if not provided to default values.
+  # if not intrinsic_reward_state:
+  #   intrinsic_reward_state = IntrinsicRewardState(
+  #       memory=jnp.inf * jnp.ones(shape=(max_memory_size,
+  #                                        embeddings.shape[-1])))
+  #   # Pad the first num_neighbors entries with zeros.
+  #   padding = jnp.zeros((num_neighbors, embeddings.shape[-1]))
+  #   intrinsic_reward_state.memory = (
+  #       intrinsic_reward_state.memory.at[:num_neighbors, :].set(padding))
+  # else:
+  chex.assert_shape(intrinsic_reward_state.memory,
+                      (max_memory_size, embeddings.shape[-1]))
+
+  # Compute the KNN from the embeddings using the square distances from
+  # the KNN d²(xₖ, x). Results are not guaranteed to be ordered.
+  jit_knn_query = jax.jit(knn_query, static_argnums=[2,])
+  knn_query_result = jit_knn_query(intrinsic_reward_state.memory, embeddings,
+                                   num_neighbors)
+
+  # Insert embeddings into memory in a ring buffer fashion.
+  memory = intrinsic_reward_state.memory
+  start_index = intrinsic_reward_state.next_memory_index % memory.shape[0]
+  indices = (jnp.arange(embeddings.shape[0]) + start_index) % memory.shape[0]
+  memory = jnp.asarray(memory).at[indices].set(embeddings)
+
+  nn_distances_sq = knn_query_result.neighbor_neg_distances
+
+  # Unpack running distance statistics, and update the running mean dₘ²
+  distance_sum = intrinsic_reward_state.distance_sum
+  distance_sum += jnp.sum(nn_distances_sq)
+  distance_counts = intrinsic_reward_state.distance_count
+  distance_counts += nn_distances_sq.size
+
+  # We compute the sum of a kernel similarity with the KNN and set to zero
+  # the reward when this similarity exceeds a given value (max_similarity)
+  # Compute rate = d(xₖ, x)² / dₘ²
+  mean_distance = distance_sum / distance_counts
+  distance_rate = nn_distances_sq / (mean_distance + constant)
+
+  # The distance rate becomes 0 if already small: r <- max(r-ξ, 0).
+  distance_rate = jnp.maximum(distance_rate - cluster_distance,
+                              jnp.zeros_like(distance_rate))
+
+  # Compute the Kernel value K(xₖ, x) = ε/(rate + ε).
+  kernel_output = epsilon / (distance_rate + epsilon)
+
+  # Compute the similarity for the embedding x:
+  # s = √(Σ_{xₖ ∈ Nₖ} K(xₖ, x)) + c
+  similarity = jnp.sqrt(jnp.sum(kernel_output, axis=-1)) + constant
+
+  # Compute the intrinsic reward:
+  # r = 1 / s.
+  reward_new = jnp.ones_like(embeddings[..., 0]) / similarity
+
+  # Zero the reward if similarity is greater than max_similarity
+  # r <- 0 if s > sₘₐₓ otherwise r.
+  max_similarity_reached = similarity > max_similarity
+  reward = jnp.where(max_similarity_reached, 0, reward_new)
+
+  # r <- β * r
+  reward *= reward_scale
+
+  return reward, IntrinsicRewardState(
+      memory=memory,
+      next_memory_index=start_index + embeddings.shape[0] % max_memory_size,
+      distance_sum=distance_sum,
+      distance_count=distance_counts)
+  
+def init_eir_state(max_memory_size, num_neighbors, feature_dim): 
+    intrinsic_reward_state = IntrinsicRewardState(
+        memory=jnp.inf * jnp.ones(shape=(max_memory_size, feature_dim)))
+    # Pad the first num_neighbors entries with zeros.
+    padding = jnp.zeros((num_neighbors, feature_dim))
+    intrinsic_reward_state.memory = (
+        intrinsic_reward_state.memory.at[:num_neighbors, :].set(padding))
+    return intrinsic_reward_state
+
+def compute_eir(new_embeddings, #FIXME: note that currently this does not reset when environment finishes
+                intrinsic_reward_state,
+                num_neighbors,
+                max_memory_size,):
+    intrinsic_reward, next_intrinsic_reward_state = episodic_memory_intrinsic_rewards(
+        embeddings=new_embeddings,
+        num_neighbors=num_neighbors,
+        reward_scale=1.0,
+        intrinsic_reward_state=intrinsic_reward_state,
+        max_memory_size=max_memory_size,
+    )
+    return next_intrinsic_reward_state, intrinsic_reward
 
 # (random,human)
 ATARI_SCORES = {
@@ -232,6 +449,38 @@ class CNN(nn.Module):
         x = nn.relu(x)
         return x
 
+class INVCNN(nn.Module):
+    @nn.compact
+    def __call__(self, x: jnp.ndarray, train: bool):
+        x = nn.Conv(
+            32,
+            kernel_size=(8, 8),
+            strides=(4, 4),
+            padding="VALID",
+            kernel_init=nn.initializers.he_normal(),
+        )(x)
+        x = nn.relu(x)
+        x = nn.Conv(
+            64,
+            kernel_size=(4, 4),
+            strides=(2, 2),
+            padding="VALID",
+            kernel_init=nn.initializers.he_normal(),
+        )(x)
+        x = nn.relu(x)
+        x = nn.Conv(
+            64,
+            kernel_size=(3, 3),
+            strides=(1, 1),
+            padding="VALID",
+            kernel_init=nn.initializers.he_normal(),
+        )(x)
+        x = nn.relu(x)
+        x = x.reshape((x.shape[0], -1))
+        x = nn.Dense(32, kernel_init=nn.initializers.he_normal())(x)
+        x = nn.relu(x)
+        return x
+
 
 class QNetwork(nn.Module):
     action_dim: int
@@ -250,7 +499,113 @@ class QNetwork(nn.Module):
         x = CNN(norm_type=self.norm_type)(x, train)
         x = nn.Dense(self.action_dim)(x)
         return x
+    
+    
+class INVCNN(nn.Module):
+    @nn.compact
+    def __call__(self, x: jnp.ndarray, train: bool):
+        x = x / 255.0
+        x = nn.Conv(
+            32,
+            kernel_size=(8, 8),
+            strides=(4, 4),
+            padding="VALID",
+            kernel_init=nn.initializers.he_normal(),
+        )(x)
+        x = nn.relu(x)
+        x = nn.Conv(
+            64,
+            kernel_size=(4, 4),
+            strides=(2, 2),
+            padding="VALID",
+            kernel_init=nn.initializers.he_normal(),
+        )(x)
+        x = nn.relu(x)
+        x = nn.Conv(
+            64,
+            kernel_size=(3, 3),
+            strides=(1, 1),
+            padding="VALID",
+            kernel_init=nn.initializers.he_normal(),
+        )(x)
+        x = nn.relu(x)
+        x = x.reshape((x.shape[0], -1))
+        x = nn.Dense(32, kernel_init=nn.initializers.he_normal())(x)
+        x = nn.relu(x)
+        return x
+    
+class INVNetwork(nn.Module):
+    action_dim: int
 
+    def setup(self):
+        self.encoder = INVCNN(name="encoder")  # single shared instance
+
+    @nn.compact
+    def __call__(self, before_action_x, after_action_x, train: bool):
+        before_action_x = jnp.transpose(before_action_x, (0, 2, 3, 1))
+        after_action_x  = jnp.transpose(after_action_x,  (0, 2, 3, 1))
+
+        # shared weights used twice
+        before_feats = self.encoder(before_action_x, train)
+        after_feats  = self.encoder(after_action_x,  train)
+
+        x = jnp.concatenate([before_feats, after_feats], axis=-1)
+        x = nn.Dense(128, kernel_init=nn.initializers.he_normal())(x)
+        x = nn.relu(x)
+        x = nn.Dense(self.action_dim, kernel_init=nn.initializers.he_normal())(x)
+        return nn.log_softmax(x)
+
+    def get_inv_features(self, x: jnp.ndarray, ):
+        x = jnp.transpose(x, (0, 2, 3, 1))
+        return self.encoder(x, train=False)  # reuses same params
+    
+
+class RNDCNN(nn.Module):
+    @nn.compact
+    def __call__(self, x: jnp.ndarray, train: bool):
+        x = x / 255.0
+        x = nn.Conv(
+            32,
+            kernel_size=(8, 8),
+            strides=(4, 4),
+            padding="VALID",
+            kernel_init=nn.initializers.he_normal(),
+        )(x)
+        x = nn.relu(x)
+        x = nn.Conv(
+            64,
+            kernel_size=(4, 4),
+            strides=(2, 2),
+            padding="VALID",
+            kernel_init=nn.initializers.he_normal(),
+        )(x)
+        x = nn.relu(x)
+        x = nn.Conv(
+            64,
+            kernel_size=(3, 3),
+            strides=(1, 1),
+            padding="VALID",
+            kernel_init=nn.initializers.he_normal(),
+        )(x)
+        x = nn.relu(x)
+        x = x.reshape((x.shape[0], -1))
+        x = nn.Dense(128, kernel_init=nn.initializers.he_normal())(x)
+        return x  
+    
+
+class RNDNetwork(nn.Module):
+    def setup(self):
+        self.random_network = RNDCNN()
+        self.prediction_network = RNDCNN()
+
+    @nn.compact
+    def __call__(self, x: jnp.ndarray, train: bool):
+        x = jnp.transpose(x, (0, 2, 3, 1))
+        random_network_features = self.random_network(x, train)
+        random_network_features = jax.lax.stop_gradient(random_network_features)
+        prediction_network_features = self.prediction_network(x, train)
+        error = jnp.mean(jnp.square(random_network_features - prediction_network_features), axis=-1)
+        return error
 
 @chex.dataclass(frozen=True)
 class Transition:
@@ -260,10 +615,11 @@ class Transition:
     done: chex.Array
     next_obs: chex.Array
     q_val: chex.Array
-    gallery_reward: chex.Array
-    gallery_knn_reward: chex.Array
-    gallery_rnd_reward: chex.Array
     original_reward: chex.Array
+    eir_reward: chex.Array
+    next_obs_inv_features: chex.Array
+    rnd_error: chex.Array
+    rnd_reward: chex.Array
 
 
 class CustomTrainState(TrainState):
@@ -372,12 +728,20 @@ def make_train(config):
             norm_type=config["NORM_TYPE"],
             norm_input=config.get("NORM_INPUT", False),
         )
+        
+        inv_network = INVNetwork(
+            action_dim=env.single_action_space.n,
+        )
+        
+        rnd_network = RNDNetwork()
 
         def create_agent(rng):
             init_x = jnp.zeros((1, *env.single_observation_space.shape))
             if config["SCALE_FACTOR"] > 1:
                 init_x = nearest_neighbor_upscale(init_x, scale_factor=config["SCALE_FACTOR"])
             network_variables = network.init(rng, init_x, train=False)
+            inv_network_variables = inv_network.init(rng, init_x, init_x, train=False)
+            rnd_network_variables = rnd_network.init(rng, init_x, train=False)
 
             tx = optax.chain(
                 optax.clip_by_global_norm(config["MAX_GRAD_NORM"]),
@@ -390,29 +754,43 @@ def make_train(config):
                 batch_stats=network_variables["batch_stats"],
                 tx=tx,
             )
-            return train_state
+            
+            assert "batch_stats" not in inv_network_variables, "our inverse dynamic network does not have such thing as described in the never give up paper"
+            inv_train_state = CustomTrainState.create(
+                apply_fn=inv_network.apply,
+                params=inv_network_variables["params"],
+                batch_stats=None,
+                tx=tx,
+            )
+            
+            rnd_train_state = CustomTrainState.create(
+                apply_fn=rnd_network.apply,
+                params=rnd_network_variables["params"],
+                batch_stats=None,
+                tx=tx,
+            )
+            
+            return train_state, inv_train_state, rnd_train_state
 
         rng, _rng = jax.random.split(rng)
-        train_state = create_agent(rng)
+        train_state, inv_train_state, rnd_train_state = create_agent(rng)
         
-        if config["TEST_DURING_TRAINING"]:
-            NUM_TOTAL_ENVS = config["NUM_ENVS"] + config["TEST_ENVS"]
-        else:
-            NUM_TOTAL_ENVS = config["NUM_ENVS"]
+        NUM_TOTAL_ENVS = config["NUM_ENVS"]
+        if config.get("TEST_DURING_TRAINING", False):
+            NUM_TOTAL_ENVS += config["TEST_ENVS"]
+            
+        eir_state = jax.vmap(lambda _: init_eir_state(max_memory_size=config["NGU"]["MAX_MEMORY_SIZE"],  # FIXME: note that currently this does not reset when environment finishes, we can still use it for now but this is not ideal
+                                   num_neighbors=config["NGU"]["NUM_NEIGHBORS"],
+                                   feature_dim=32))(jnp.arange(NUM_TOTAL_ENVS)) # This comes from the head of the INVCNN
         
-        observation_shape = env.observation_space.shape
-        downscale_factor = 8
-        downscaled_observation_shape = (observation_shape[0], observation_shape[1] // downscale_factor, observation_shape[2] // downscale_factor)
-        gallery_obs = jnp.zeros((NUM_TOTAL_ENVS, config["GALLERY_DEPTH"],*downscaled_observation_shape), dtype=jnp.uint8)
-        gallery_counter = jnp.zeros((NUM_TOTAL_ENVS,), dtype=jnp.int32)
-        
-        # TRAINING LOOP
-        def _update_step(runner_state, unused):
-            train_state, expl_state, test_metrics, rng, (gallery_obs, gallery_counter) = runner_state
 
-            # SAMPLE PHASE
+        ##### PQN LOOP #####
+        def _update_step(runner_state, unused):
+            train_state, inv_train_state, rnd_train_state, eir_state, expl_state, test_metrics, rng = runner_state
+
+            ##### SAMPLE ENV #####
             def _step_env(carry, _):
-                last_obs, env_state, rng, (gallery_obs, gallery_counter) = carry
+                last_obs, env_state, rng = carry
                 rng, rng_a, rng_s = jax.random.split(rng, 3)
                 q_vals = network.apply(
                     {
@@ -430,69 +808,48 @@ def make_train(config):
                     eps = jnp.concatenate((eps, jnp.zeros(config["TEST_ENVS"])))
                 new_action = jax.vmap(eps_greedy_exploration)(_rngs, q_vals, eps)
 
-                new_obs, new_env_state, original_reward, new_done, info = env.step(
+                new_obs, new_env_state, reward, new_done, info = env.step(
                     env_state, new_action
                 )
                 
-                gallery_counter = jnp.where(new_done, 0, gallery_counter + 1)
-                gallery_update_index = (gallery_counter // config["GALLERY_UPDATE_FREQ"]) % config["GALLERY_DEPTH"]
-                gallery_should_update = gallery_counter % config["GALLERY_UPDATE_FREQ"] == 0
-                downscaled_last_obs = last_obs[:, :, ::downscale_factor, ::downscale_factor]
-                updated_gallery_obs = gallery_obs.at[jnp.arange(NUM_TOTAL_ENVS), gallery_update_index, ...].set(downscaled_last_obs)
-                gallery_obs = jax.vmap(lambda g, u_g, s: jnp.where(s, u_g, g))(gallery_obs, updated_gallery_obs, gallery_should_update)
-                
-                gallery_valid_index = jnp.minimum(gallery_counter // config["GALLERY_UPDATE_FREQ"], config["GALLERY_DEPTH"] - 1)
-                gallery_valid_mask = jnp.tril(jnp.ones((config["GALLERY_DEPTH"], config["GALLERY_DEPTH"])))[gallery_valid_index]
-                
-                def single_frame_gallery_reward(obs, gallery_obs, mask):
-                    obs = obs.astype(jnp.float16) / 255.0
-                    gallery_obs = gallery_obs / 255.0
-                    diff = jnp.abs(obs - gallery_obs)
-                    return diff.mean() * mask
-                
-                def whole_gallery_reward(obs, gallery_obs, mask):
-                    gallery_rewards = jax.vmap(lambda g, m: single_frame_gallery_reward(obs, g, m))(gallery_obs, mask)
-                    return gallery_rewards.sum() / mask.sum()
-                
-                def rnd_gallery_reward(obs, gallery_obs, mask):
-                    obs = obs.astype(jnp.float16) / 255.0
-                    gallery_obs = gallery_obs.astype(jnp.float16) / 255.0
-                    diff = jnp.abs(gallery_obs - obs).mean(axis=(2, 3, 4))
-                    return (diff * mask).mean()
-                downscaled_new_obs = new_obs[:, :, ::downscale_factor, ::downscale_factor]
-                gallery_knn_rewards = jax.vmap(whole_gallery_reward)(downscaled_new_obs, gallery_obs, gallery_valid_mask)
-                gallery_rnd_rewards = jax.vmap(lambda o: rnd_gallery_reward(o, gallery_obs[0:16, ...].astype(jnp.float16), gallery_valid_mask[0:16, ...]))(downscaled_new_obs)
-                gallery_rewards = gallery_knn_rewards * gallery_rnd_rewards 
-                
-                reward = original_reward * config.get("REW_SCALE", 1) + gallery_rewards * config["GALLERY_REWARD_SCALE"]
-                    
-                
                 if config["SCALE_FACTOR"] > 1:
                     new_obs = nearest_neighbor_upscale(new_obs, scale_factor=config["SCALE_FACTOR"])
+                    
+                inv_features = inv_network.apply({"params": inv_train_state.params,}, new_obs, method=inv_network.get_inv_features)
+                
+                rnd_error = rnd_network.apply({"params": rnd_train_state.params,}, new_obs, train=False)
 
                 transition = Transition(
                     obs=last_obs,
                     action=new_action,
-                    reward=reward,
+                    reward=-int(1e9), # we'll fill reward later, however, we want it to show up in the logs if we forget to fill it
                     done=new_done,
                     next_obs=new_obs,
+                    next_obs_inv_features=inv_features,
                     q_val=q_vals,
-                    gallery_knn_reward=gallery_knn_rewards,
-                    gallery_rnd_reward=gallery_rnd_rewards,
-                    gallery_reward=gallery_rewards * config["GALLERY_REWARD_SCALE"],
-                    original_reward=original_reward * config.get("REW_SCALE", 1)
+                    original_reward=reward,
+                    eir_reward=-int(1e9), # we'll fill eir_reward later, however, we want it to show up in the logs if we forget to fill it
+                    rnd_error=rnd_error,
+                    rnd_reward=-int(1e9), # we'll fill rnd_reward later, however, we want it to show up in the logs if we forget to fill it
                 )
-                return (new_obs, new_env_state, rng, (gallery_obs, gallery_counter)), (transition, info)
+                return (new_obs, new_env_state, rng), (transition, info)
 
             # step the env
             rng, _rng = jax.random.split(rng)
-            (*expl_state, rng, (gallery_obs, gallery_counter)), (transitions, infos) = jax.lax.scan(
+            (*expl_state, rng), (transitions, infos) = jax.lax.scan(
                 _step_env,
-                (*expl_state, _rng, (gallery_obs, gallery_counter)),
+                (*expl_state, _rng),
                 None,
                 config["NUM_STEPS"],
             )
             expl_state = tuple(expl_state)
+            
+            inv_features = transitions.next_obs_inv_features.transpose(1, 0, 2)
+            eir_state, eir_rewards = jax.vmap(lambda f, s: compute_eir(f, s, config["NGU"]["NUM_NEIGHBORS"], config["NGU"]["MAX_MEMORY_SIZE"]))(inv_features, eir_state)
+            eir_rewards = eir_rewards.transpose(1, 0) # tranpose from (num_envs, num_steps) to (num_steps, num_envs)
+            rnd_rewards = 1 + (transitions.rnd_error - transitions.rnd_error.mean()) / (transitions.rnd_error.std() + 1e-3) #FIXME: this is a crude heuristic and different from the never give up paper
+            training_reward = transitions.original_reward * config.get("REW_SCALE", 1) + eir_rewards * rnd_rewards * config["NGU"]["NGU_REWARD_SCALE"]
+            transitions = transitions.replace(eir_reward=eir_rewards, reward=training_reward)
 
             if config.get("TEST_DURING_TRAINING", False):
                 # remove testing envs
@@ -552,7 +909,8 @@ def make_train(config):
                 last_q, transitions.q_val, transitions.reward, transitions.done
             )
 
-            # NETWORKS UPDATE
+            ##### TRAINING NETWORKS #####
+            ### Q-NETWORK ###
             def _learn_epoch(carry, _):
                 train_state, rng = carry
 
@@ -619,6 +977,132 @@ def make_train(config):
             )
 
             train_state = train_state.replace(n_updates=train_state.n_updates + 1)
+            
+            ### INV-NETWORK ###
+            def _learn_epoch_inv(carry, _):
+                train_state, rng = carry
+
+                def _learn_phase(carry, minibatch_and_target):
+                    train_state, rng = carry
+                    minibatch, target = minibatch_and_target
+
+                    def _loss_fn(params):
+                        predicted_action_logprobs = inv_network.apply(
+                            {"params": params},
+                            minibatch.obs,
+                            minibatch.next_obs,
+                            train=True,
+                        )  # (batch_size*2, num_actions)
+
+                        gold_actions = minibatch.action
+                        gold_actions_one_hot = jax.nn.one_hot(gold_actions, predicted_action_logprobs.shape[-1])
+                        loss = -jnp.mean(jnp.sum(gold_actions_one_hot * predicted_action_logprobs, axis=-1)) 
+                        #FIXME: the predicted actions logprobs are not uniform at initializations, get back to this if things are not working
+
+                        return loss, predicted_action_logprobs
+
+                    (loss, predicted_action_logprobs), grads = jax.value_and_grad(
+                        _loss_fn, has_aux=True
+                    )(train_state.params)
+                    train_state = train_state.apply_gradients(grads=grads)
+                    train_state = train_state.replace(
+                        grad_steps=train_state.grad_steps + 1,
+                    )
+                    return (train_state, rng), (loss, predicted_action_logprobs)
+
+                def preprocess_transition(x, rng):
+                    x = x.reshape(
+                        -1, *x.shape[2:]
+                    )  # num_steps*num_envs (batch_size), ...
+                    x = jax.random.permutation(rng, x)  # shuffle the transitions
+                    x = x.reshape(
+                        config["NUM_MINIBATCHES"], -1, *x.shape[1:]
+                    )  # num_mini_updates, batch_size/num_mini_updates, ...
+                    return x
+
+                rng, _rng = jax.random.split(rng)
+                minibatches = jax.tree_util.tree_map(
+                    lambda x: preprocess_transition(x, _rng), transitions
+                )  # num_actors*num_envs (batch_size), ...
+                targets = jax.tree.map(
+                    lambda x: preprocess_transition(x, _rng), lambda_targets
+                )
+
+                rng, _rng = jax.random.split(rng)
+                (train_state, rng), (loss, predicted_action_logprobs) = jax.lax.scan(
+                    _learn_phase, (train_state, rng), (minibatches, targets)
+                )
+
+                return (train_state, rng), (loss, predicted_action_logprobs)
+
+            rng, _rng = jax.random.split(rng)
+            (inv_train_state, rng), (inv_loss, predicted_action_logprobs) = jax.lax.scan(
+                _learn_epoch_inv, (inv_train_state, rng), None, config["NUM_EPOCHS"]
+            )
+
+            inv_train_state = inv_train_state.replace(n_updates=inv_train_state.n_updates + 1)
+            
+            ### RND-NETWORK ###
+            def _learn_epoch_rnd(carry, _):
+                train_state, rng = carry
+
+                def _learn_phase(carry, minibatch_and_target):
+                    train_state, rng = carry
+                    minibatch, target = minibatch_and_target
+
+                    def _loss_fn(params):
+                        error = rnd_network.apply(
+                            {"params": params},
+                            minibatch.next_obs,
+                            train=True,
+                        )  # (batch_size*2, num_actions)
+
+                        loss = error.mean()
+
+                        return loss, error
+
+                    (loss, error), grads = jax.value_and_grad(
+                        _loss_fn, has_aux=True
+                    )(train_state.params)
+                    train_state = train_state.apply_gradients(grads=grads)
+                    train_state = train_state.replace(
+                        grad_steps=train_state.grad_steps + 1,
+                    )
+                    return (train_state, rng), (loss, error)
+
+                def preprocess_transition(x, rng):
+                    x = x.reshape(
+                        -1, *x.shape[2:]
+                    )  # num_steps*num_envs (batch_size), ...
+                    x = jax.random.permutation(rng, x)  # shuffle the transitions
+                    x = x.reshape(
+                        config["NUM_MINIBATCHES"], -1, *x.shape[1:]
+                    )  # num_mini_updates, batch_size/num_mini_updates, ...
+                    return x
+
+                rng, _rng = jax.random.split(rng)
+                minibatches = jax.tree_util.tree_map(
+                    lambda x: preprocess_transition(x, _rng), transitions
+                )  # num_actors*num_envs (batch_size), ...
+                targets = jax.tree.map(
+                    lambda x: preprocess_transition(x, _rng), lambda_targets
+                )
+
+                rng, _rng = jax.random.split(rng)
+                (train_state, rng), (loss, error) = jax.lax.scan(
+                    _learn_phase, (train_state, rng), (minibatches, targets)
+                )
+
+                return (train_state, rng), (loss, error)
+
+            rng, _rng = jax.random.split(rng)
+            (rnd_train_state, rng), (rnd_loss, error) = jax.lax.scan(
+                _learn_epoch_rnd, (rnd_train_state, rng), None, config["NUM_EPOCHS"]
+            )
+
+            rnd_train_state = rnd_train_state.replace(n_updates=rnd_train_state.n_updates + 1)            
+            
+            ##### LOGGING #####
 
             if config.get("TEST_DURING_TRAINING", False):
                 test_infos = jax.tree.map(lambda x: x[:, -config["TEST_ENVS"] :], infos)
@@ -636,28 +1120,20 @@ def make_train(config):
                 "td_loss": loss.mean(),
                 "qvals": qvals.mean(),
                 "max_reward": transitions.reward.max(),
+                "min_reward": transitions.reward.min(),
+                "std_reward": transitions.reward.std(),
+                "mean_eir_reward": transitions.eir_reward.mean(),
+                "std_eir_reward": transitions.eir_reward.std(),
+                "max_eir_reward": transitions.eir_reward.max(),
+                "min_eir_reward": transitions.eir_reward.min(),
+                "mean_original_reward": transitions.original_reward.mean(),
+                "std_original_reward": transitions.original_reward.std(),
+                "max_original_reward": transitions.original_reward.max(),
+                "min_original_reward": transitions.original_reward.min(),
+                "inv_loss": inv_loss.mean(),
+                "rnd_loss": rnd_loss.mean(),
             }
             
-            metrics["gallery_reward"] = transitions.gallery_reward.mean()
-            metrics["gallery_reward_std"] = transitions.gallery_reward.std()
-            metrics["gallery_reward_max"] = transitions.gallery_reward.max()
-            metrics["gallery_reward_min"] = transitions.gallery_reward.min()
-            metrics["original_reward"] = transitions.original_reward.mean()
-            metrics["original_reward_std"] = transitions.original_reward.std()
-            metrics["original_reward_max"] = transitions.original_reward.max()
-            metrics["original_reward_min"] = transitions.original_reward.min()
-            metrics["gallery_knn_reward"] = transitions.gallery_knn_reward.mean()
-            metrics["gallery_knn_reward_std"] = transitions.gallery_knn_reward.std()
-            metrics["gallery_knn_reward_max"] = transitions.gallery_knn_reward.max()
-            metrics["gallery_knn_reward_min"] = transitions.gallery_knn_reward.min()
-            metrics["gallery_rnd_reward"] = transitions.gallery_rnd_reward.mean()
-            metrics["gallery_rnd_reward_std"] = transitions.gallery_rnd_reward.std()
-            metrics["gallery_rnd_reward_max"] = transitions.gallery_rnd_reward.max()
-            metrics["gallery_rnd_reward_min"] = transitions.gallery_rnd_reward.min()
-            metrics["reward"] = transitions.reward.mean()
-            metrics["reward_max"] = transitions.reward.max()
-            metrics["reward_min"] = transitions.reward.min()
-
             metrics.update({k: v.mean() for k, v in infos.items()})
             if config.get("TEST_DURING_TRAINING", False):
                 metrics.update({f"test_{k}": v.mean() for k, v in test_infos.items()})
@@ -678,7 +1154,7 @@ def make_train(config):
 
                 jax.debug.callback(callback, metrics, original_seed)
 
-            runner_state = (train_state, tuple(expl_state), test_metrics, rng, (gallery_obs, gallery_counter))
+            runner_state = (train_state, inv_train_state, rnd_train_state, eir_state, tuple(expl_state), test_metrics, rng)
 
             return runner_state, metrics
 
@@ -688,7 +1164,7 @@ def make_train(config):
         # train
         rng, _rng = jax.random.split(rng)
         expl_state = (init_obs, env_state)
-        runner_state = (train_state, expl_state, test_metrics, _rng, (gallery_obs, gallery_counter))
+        runner_state = (train_state, inv_train_state, rnd_train_state, eir_state, expl_state, test_metrics, _rng)
 
         runner_state, metrics = jax.lax.scan(
             _update_step, runner_state, None, config["NUM_UPDATES"]
@@ -733,15 +1209,22 @@ def single_run(config):
         from jaxmarl.wrappers.baselines import save_params
 
         model_state = outs["runner_state"][0]
-        save_dir = os.path.join(config["SAVE_PATH"], config["RUN_ID"], env_name)
+        save_dir = os.path.join(config["SAVE_PATH"], env_name)
         os.makedirs(save_dir, exist_ok=True)
-        OmegaConf.save(config,os.path.join(save_dir, f"config.yaml"))
+        OmegaConf.save(
+            config,
+            os.path.join(
+                save_dir, f"{alg_name}_{env_name}_seed{config['SEED']}_config.yaml"
+            ),
+        )
 
         # assumes not vmpapped seeds
         params = model_state.params
-        batch_stats = model_state.batch_stats
-        save_params({"params": params, "batch_stats": batch_stats}, os.path.join(save_dir, f'step_final.safetensors'))
-        
+        save_path = os.path.join(
+            save_dir,
+            f"{alg_name}_{env_name}_seed{config['SEED']}.safetensors",
+        )
+        save_params(params, save_path)
 
 
 def tune(default_config):

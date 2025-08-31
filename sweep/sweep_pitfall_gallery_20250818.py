@@ -1,6 +1,6 @@
 from sweep_utils import submit_slurm_job, get_compute_command
 ### Jobs ###
-BASE_RUN_ID = "20250818_pitfall_gallery"
+BASE_RUN_ID = "20250818_pitfall_gallery_rnd_augment"
 BASE_PYTHON_COMMAND = "python purejaxql/pqn_atari_gallery.py" \
             " RUN_ID={run_id}" \
             " WANDB_TAGS={wandb_tags}" \
@@ -56,6 +56,12 @@ def get_jobs():
                                                episodic_life=False, reward_clip=False, gallery_depth=100, gallery_update_freq=20, gallery_reward_scale=1.0),
         'gallery_GF20_GDEPTH100_GS100': get_job(num_envs=512, img_size=160, total_timesteps=25e7, eps_finish=0.01,rew_scale=0.001,
                                                episodic_life=False, reward_clip=False, gallery_depth=100, gallery_update_freq=20, gallery_reward_scale=100.0),
+        'gallery_GF20_GDEPTH100_GS0_short': get_job(num_envs=512, img_size=160, total_timesteps=4e7, eps_finish=0.01,rew_scale=0.001,
+                                               episodic_life=False, reward_clip=False, gallery_depth=100, gallery_update_freq=20, gallery_reward_scale=0.0),
+        'gallery_GF20_GDEPTH100_GS1_short': get_job(num_envs=512, img_size=160, total_timesteps=4e7, eps_finish=0.01,rew_scale=0.001,
+                                               episodic_life=False, reward_clip=False, gallery_depth=100, gallery_update_freq=20, gallery_reward_scale=1.0),
+        'gallery_GF40_GDEPTH50_GS100_med': get_job(num_envs=512, img_size=160, total_timesteps=25e7, eps_finish=0.01,rew_scale=0.001,
+                                                    episodic_life=False, reward_clip=False, gallery_depth=50, gallery_update_freq=40, gallery_reward_scale=100.0),
     }
     
     return jobs
