@@ -231,6 +231,18 @@ class CNN(nn.Module):
         x = nn.relu(x)
         return x
 
+class MaskedLSTMCell(nn.Module):
+    features: int
+    def setup(self):
+        self.cell = nn.LSTMCell(features=self.features)
+
+    def __call__(self, carry, inputs):
+        (c, h) = carry                       # (B,H)
+        x_t, m_t = inputs                    # x_t: (B,F), m_t: (B,)
+        m_t = m_t[:, None]                   # (B,1)
+        carry = (c * m_t, h * m_t)           # reset where episode ended
+        return self.cell(carry, x_t)
+
 class ActorCritic(nn.Module):
     action_dim: int
     hidden_size: int = 256
@@ -239,20 +251,20 @@ class ActorCritic(nn.Module):
 
     def setup(self):
         self.encoder = CNN(norm_type=self.norm_type, name="cnn")
-        self.recurrent = nn.LSTMCell(name="lstm", features=self.hidden_size)
+        self.lstm_scan = nn.scan(
+            MaskedLSTMCell,
+            variable_broadcast="params",
+            split_rngs={"params": False},
+            in_axes=1, out_axes=1
+        )(features=self.hidden_size)
         self.actor_head  = nn.Dense(self.action_dim, name="actor_head")
         self.critic_head = nn.Dense(1, name="critic_head")
         self.encoder_bn = nn.BatchNorm(momentum=0.99, epsilon=1e-5, name="encoder_bn")
-    
-    def actor(self, x, carry, train: bool):
-        feat, carry = self._encode(x, carry, train)
-        return self.actor_head(feat), carry
 
-    def critic(self, x, carry, train: bool):
-        feat, carry = self._encode(x, carry, train)
-        return self.critic_head(feat), carry
-
-    def _encode(self, x, carry, train: bool):
+    def encode(self, x, carry, train: bool, dones: jnp.ndarray | None = None):
+        if x.ndim == 5:
+            B, T = x.shape[:2]
+            x = x.reshape((B*T,) + x.shape[2:])
         x = jnp.transpose(x, (0, 2, 3, 1))
         if self.norm_input:
             x = self.encoder_bn(x, use_running_average=not train)
@@ -260,19 +272,50 @@ class ActorCritic(nn.Module):
             _ = self.encoder_bn(x, use_running_average=True)
             x = x / 255.0
         feat = self.encoder(x, train)
-        carry, out = self.recurrent(carry, feat)
-        return out, carry
+        if dones is None:
+            B = feat.shape[0]
+            feat = feat[:, None, :]                          # (B,1,F)
+            masks = jnp.ones((B, 1), jnp.float32)            # (B,1)
+            (cT, hT), ys = self.lstm_scan(carry, (feat, masks))   # ys: (B,1,H)
+            out = ys[:, 0, :]                                # (B,H)
+        else:
+            B = dones.shape[0]
+            T = dones.shape[1]
+            feat = feat.reshape(B, T, -1)                    # (B,T,F)
+            masks = jnp.concatenate(
+                [jnp.ones((B, 1), jnp.float32), 1.0 - dones[:, :-1].astype(jnp.float32)],
+                axis=1
+            )                                                # (B,T)
+            (cT, hT), out = self.lstm_scan(carry, (feat, masks))  # out: (B,T,H)
+        return out, (cT, hT)
 
     def __call__(self, x, carry: Tuple[jnp.ndarray, jnp.ndarray],*, train: bool = False):
-        feat, carry = self._encode(x, carry, train)
+        feat, carry = self.encode(x, carry, train, dones=None)
         logits = self.actor_head(feat)
-        value = self.critic_head(feat).squeeze(-1)
+        value = self.critic_head(feat)
         return value, logits, carry
+    
+    def actor(self, x, carry, train: bool):
+        feat, carry = self.encode(x, carry, train, dones=None)
+        return self.actor_head(feat), carry
+
+    def critic(self, x, carry, train: bool):
+        feat, carry = self.encode(x, carry, train, dones=None)
+        return self.critic_head(feat), carry
+
+    def actor_sequence(self, x, carry, dones, train: bool):
+        feat, carry = self.encode(x, carry, train, dones=dones)
+        return self.actor_head(feat), carry
+
+    def critic_sequence(self, x, carry, dones, train: bool):
+        feat, carry = self.encode(x, carry, train, dones=dones)
+        return self.critic_head(feat).squeeze(-1), carry
+
 
 @struct.dataclass
 class RNNState:
-    h: jnp.ndarray   # (total_envs, hidden_size)
-    c: jnp.ndarray   # (total_envs, hidden_size)
+    c: jnp.ndarray
+    h: jnp.ndarray
 
 @chex.dataclass(frozen=True)
 class Transition:
@@ -313,27 +356,6 @@ def _policy_from_logits(logits: jax.Array):
     entropy   = -jnp.sum(probs * log_probs, axis=-1)
     return probs, log_probs, entropy    
 
-def preprocess_agent_transition(x, rng, config):
-    # x: (num_steps, num_envs, ...)
-    flattened = x.reshape(-1, *x.shape[2:])
-    shuffled = jax.random.permutation(rng, flattened)
-    return shuffled.reshape(config["NUM_MINIBATCHES"], -1, *x.shape[2:])
-
-def preprocess_transitions_per_agent(x, rng, config):
-    # x: (num_steps, total_envs, ...), with total_envs = NUM_AGENTS * NUM_ENVS.
-    num_steps = x.shape[0]
-    num_agents = config["NUM_AGENTS"]
-    num_envs = config["NUM_ENVS"]
-    # First, transpose to (total_envs, num_steps, ...)
-    x = jnp.transpose(x, (1, 0) + tuple(range(2, x.ndim)))
-    # Then, reshape total_envs into (num_agents, num_envs)
-    x = x.reshape((num_agents, num_envs, num_steps) + x.shape[2:])
-    # Finally, transpose to (num_agents, num_steps, num_envs, ...)
-    x = jnp.transpose(x, (0, 2, 1) + tuple(range(3, x.ndim)))
-    # Split rng for each agent
-    rngs = jax.random.split(rng, num_agents)
-    return jax.vmap(lambda x_agent, r: preprocess_agent_transition(x_agent, r, config), in_axes=(0, 0))(x, rngs)
-
 def compute_agent_metric(metric, config):
     num_agents = config["NUM_AGENTS"]
     num_steps = config["NUM_STEPS"]
@@ -358,7 +380,7 @@ def initialize_agents(config, env, rng, network):
     dummy_x      = jnp.zeros((1, *env.single_observation_space.shape))
     h_0          = jnp.zeros((1, network.hidden_size), jnp.float32)
     c_0          = jnp.zeros_like(h_0)
-    variables    = network.init(rng, dummy_x, (h_0, c_0), train=False)
+    variables    = network.init(rng, dummy_x, (c_0, h_0), train=False)
 
     # separate copies of *identical* params / batch_stats
     base_params, base_stats = variables["params"], variables["batch_stats"]
@@ -448,9 +470,6 @@ def make_train(config):
 
     hidden_size = config.get("HIDDEN_SIZE", 256)
     init_obs, env_state = env.reset()
-    h_0 = jnp.zeros((config["NUM_AGENTS"], envs_per_agent, hidden_size), jnp.float32)
-    c_0 = jnp.zeros_like(h_0)
-    rnn_state = RNNState(h=h_0, c=c_0)
 
     def train(rng):
         original_seed = rng[0]
@@ -460,10 +479,15 @@ def make_train(config):
             action_dim = env.single_action_space.n,
             norm_type  = config["NORM_TYPE"],
             norm_input = config.get("NORM_INPUT", False),
+            hidden_size = config.get("HIDDEN_SIZE", 256),
         )
 
         rng, _rng = jax.random.split(rng)
         critic_train_states, actor_train_states = initialize_agents(config, env, rng, network)
+        
+        c_0 = jnp.zeros((config["NUM_AGENTS"], envs_per_agent, hidden_size), jnp.float32)
+        h_0 = jnp.zeros_like(c_0)
+        rnn_state = RNNState(c=c_0, h=h_0)
 
         # TRAINING LOOP
         def _update_step(runner_state, unused):
@@ -474,33 +498,33 @@ def make_train(config):
             def _step_env(carry, _):
                 last_obs, env_state, rnn_state, rng = carry
                 rng, rng_a, rng_s = jax.random.split(rng, 3)
-                h, c = rnn_state.h, rnn_state.c
+                c, h = rnn_state.c, rnn_state.h
 
-                logits, (h_new, c_new) = jax.vmap(
-                    lambda ts, obs, h_row, c_row: network.apply(
+                logits, (c_new, h_new) = jax.vmap(
+                    lambda ts, obs, c_row, h_row: network.apply(
                         {"params": ts.params, 'batch_stats': ts.batch_stats},
                         obs,
-                        (h_row, c_row),
+                        (c_row, h_row),
                         train=False,
                         method=ActorCritic.actor)
                 )(
                     actor_train_states,
                     last_obs.reshape((config["NUM_AGENTS"], envs_per_agent, *last_obs.shape[1:])),
-                    h,
-                    c
+                    c,
+                    h
                 )
                 vals, _ = jax.vmap(
-                    lambda ts, obs, h_row, c_row: network.apply(
+                    lambda ts, obs, c_row, h_row: network.apply(
                         {"params": ts.params, "batch_stats": ts.batch_stats},
                         obs,
-                        (h_row, c_row),
+                        (c_row, h_row),
                         train=False,
                         method=ActorCritic.critic)
                 )(
                     critic_train_states,
                     last_obs.reshape((config["NUM_AGENTS"], envs_per_agent, *last_obs.shape[1:])),
-                    h,
-                    c
+                    c,
+                    h
                 )
                 
                 rng_a_batched = jnp.repeat(jnp.expand_dims(rng_a, axis=0), config["NUM_AGENTS"], axis=0)
@@ -579,19 +603,23 @@ def make_train(config):
             
             next_obs = transitions.next_obs.reshape(config["NUM_STEPS"], config["NUM_AGENTS"], config["NUM_ENVS"], *transitions.next_obs.shape[2:])
             next_obs_last = next_obs[-1]
-            h_boot = transitions.h_0[-1].reshape(config["NUM_AGENTS"], config["NUM_ENVS"], -1)
-            c_boot = transitions.c_0[-1].reshape(config["NUM_AGENTS"], config["NUM_ENVS"], -1)
+            c_T = expl_state[2].c
+            h_T = expl_state[2].h
+
+            if config.get("TEST_DURING_TRAINING", False):
+                c_T = c_T[:, :config["NUM_ENVS"]]
+                h_T = h_T[:, :config["NUM_ENVS"]]
 
             last_next_value = jax.vmap(                               # over agents
-                lambda cts, obs, h_row, c_row: network.apply(
+                lambda cts, obs, c_row, h_row: network.apply(
                     {"params": cts.params,
                     "batch_stats": cts.batch_stats},
                     obs,
-                    (h_row, c_row),
+                    (c_row, h_row),
                     train=False,
                     method=ActorCritic.critic
                 )[0].squeeze(-1)
-            )(critic_train_states, next_obs_last, h_boot, c_boot) 
+            )(critic_train_states, next_obs_last, c_T, h_T) 
 
             values = jnp.concatenate([transitions.val.squeeze(-1),last_next_value.reshape((1, config["NUM_AGENTS"]*config["NUM_ENVS"]))], axis=0)
 
@@ -607,28 +635,41 @@ def make_train(config):
             def _learn_epoch(carry, _):
                 critic_train_states, actor_train_states, rng = carry
                 rng, _rng = jax.random.split(rng)
-                minibatches = jax.tree_util.tree_map(lambda x: preprocess_transitions_per_agent(x, _rng, config), transitions)
+                
+                def reshape_transitions(x):
+                    # Reshapes transitions into (num_agents, num_minibatches, -1, num_steps, ...)
+                    num_steps = x.shape[0]
+                    num_agents = config["NUM_AGENTS"]
+                    num_envs = config["NUM_ENVS"]
+                    num_minibatches = config["NUM_MINIBATCHES"]
+
+                    x = jnp.transpose(x, (1, 0) + tuple(range(2, x.ndim)))
+                    x = x.reshape((num_agents, num_envs, num_steps) + x.shape[2:])
+                    x = x.reshape(num_agents, num_minibatches, -1, *x.shape[2:])
+                    return x
+                
+                minibatches = jax.tree_util.tree_map(lambda x: reshape_transitions(x), transitions)
                 minibatches = jax.tree_util.tree_map(lambda x: jnp.swapaxes(x, 0, 1), minibatches)
-                targets = jax.tree_map(lambda x: preprocess_transitions_per_agent(x, _rng, config), lambda_targets)
+                targets = jax.tree_map(lambda x: reshape_transitions(x), lambda_targets)
                 targets = jax.tree_util.tree_map(lambda x: jnp.swapaxes(x, 0, 1), targets)
-                advantages = jax.tree_map(lambda x: preprocess_transitions_per_agent(x, _rng, config), gae_advantages)
+                advantages = jax.tree_map(lambda x: reshape_transitions(x), gae_advantages)
                 advantages = jax.tree_util.tree_map(lambda x: jnp.swapaxes(x, 0, 1), advantages)
 
                 def _learn_phase(carry, minibatch_and_target):
                     critic_train_states, actor_train_states, rng = carry
                     minibatch, target, advantage = minibatch_and_target
-                    def agent_loss_and_update(cts, ats, minibatch, target):
+                    def agent_loss_and_update(cts, ats, minibatch, target, idx):
                         # Critic loss and update
                         def _critic_loss_fn(params):
                             (pred_val, _), updates = network.apply(
                                 {"params": params, "batch_stats": cts.batch_stats},
                                 minibatch.obs,
-                                (minibatch.h_0, minibatch.c_0), 
+                                (minibatch.c_0[:,0,:], minibatch.h_0[:,0,:]),
+                                minibatch.done,
                                 train=True, 
                                 mutable=["batch_stats"],
-                                method=ActorCritic.critic
+                                method=ActorCritic.critic_sequence
                             )
-                            pred_val = pred_val.squeeze(-1)
                             loss = 0.5 * jnp.mean((pred_val - target) ** 2)
                             return loss, updates["batch_stats"]
                         (critic_loss, new_critic_bs), grads = jax.value_and_grad(_critic_loss_fn, has_aux=True)(cts.params)
@@ -641,10 +682,11 @@ def make_train(config):
                             (logits, _), updates = network.apply(
                                 {"params": actor_params, "batch_stats": ats.batch_stats},
                                 minibatch.obs,
-                                (minibatch.h_0, minibatch.c_0), 
+                                (minibatch.c_0[:,0,:], minibatch.h_0[:,0,:]),
+                                minibatch.done, 
                                 train=True, 
                                 mutable=["batch_stats"],
-                                method=ActorCritic.actor
+                                method=ActorCritic.actor_sequence
                             )
                             probs, logp, entropy = _policy_from_logits(logits)
                             
@@ -652,8 +694,8 @@ def make_train(config):
                             ratio  = jnp.exp(logp_a - minibatch.log_p.squeeze(-1))
 
                             clip_eps = config["CLIP_EPS"]
-                            unclipped = ratio * advantage
-                            clipped   = jnp.clip(ratio, 1-clip_eps, 1+clip_eps) * advantage
+                            unclipped = ratio * advantage[idx]
+                            clipped   = jnp.clip(ratio, 1-clip_eps, 1+clip_eps) * advantage[idx]
                             pg_loss   = -jnp.mean(jnp.minimum(unclipped, clipped))
 
                             ent_loss = -jnp.mean(entropy)
@@ -668,8 +710,8 @@ def make_train(config):
                         
                         return critic_loss, actor_loss, entropies, cts, ats
                     
-                    critic_loss, actor_loss, entropies, new_critic_train_states, new_actor_train_states = jax.vmap(agent_loss_and_update, in_axes=(0,0,0,0))(
-                        critic_train_states, actor_train_states, minibatch, target
+                    critic_loss, actor_loss, entropies, new_critic_train_states, new_actor_train_states = jax.vmap(agent_loss_and_update, in_axes=(0,0,0,0,0))(
+                        critic_train_states, actor_train_states, minibatch, target, jnp.arange(config['NUM_AGENTS'])
                     )
                     return (new_critic_train_states, new_actor_train_states, rng), (critic_loss, actor_loss, entropies)
         
@@ -930,11 +972,6 @@ def main(config):
     print(config)
     if config["DEBUG"]:
         jax.config.update("jax_disable_jit", True)
-        # import debugpy
-        # debugpy.listen(5678)
-        # print("Waiting for client to attach...")
-        # debugpy.wait_for_client()
-        # print("Client attached")
     print("Config:\n", OmegaConf.to_yaml(config))
     
     if config["HYP_TUNE"]:

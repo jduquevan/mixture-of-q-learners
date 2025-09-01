@@ -1,7 +1,7 @@
 ALG_NAME: "ppomix"
 TOTAL_TIMESTEPS: 5e9 # with 4 frame skip correpsnds to 200M frames
 TOTAL_TIMESTEPS_DECAY: 5e9 # will be used for decay functions (epsilon and lr)
-NUM_ENVS: 128 # parallel environments
+NUM_ENVS: 512 # parallel environments
 NUM_STEPS: 32 # steps per environment in each update
 NUM_EPOCHS: 2 # number of epochs per update
 NUM_MINIBATCHES: 32 # minibatches per epoch
@@ -13,24 +13,23 @@ GAMMA: 0.99
 LAMBDA: 0.65
 NUM_AGENTS: 1
 CLIP_EPS: 0.1
-ENT_COEFF: 0.01
-HIDDEN_SIZE: 256
+ENT_COEFF: 0.005
+HIDDEN_SIZE: 512
 
 # mixing
 MIXING_STEPS: 5000000            # every N PPO updates do a weighted merge
-EMA_ALPHA: 0.05 
+EMA_ALPHA: 0.05
 
 # env specific, see https://envpool.readthedocs.io/en/latest/env/atari.html
-ENV_NAME: "Pong-v5"
+ENV_NAME: "Breakout-v5"
 ENV_KWARGS: 
-  episodic_life: True # lost life -> done, increases sample efficiency, may hurt in some games
-  reward_clip: True # reward into -1, 1
+  episodic_life: False # lost life -> done, increases sample efficiency, may hurt in some games
+  reward_clip: False # reward into -1, 1
   repeat_action_probability: 0. # sticky actions
   frame_skip: 4
-  noop_max: 30
-  img_width: 400
-  img_height: 400
-
+  noop_max: 1
+  img_width: 160
+  img_height: 160
 # evaluation
 TEST_DURING_TRAINING: True 
 TEST_ENVS: 4

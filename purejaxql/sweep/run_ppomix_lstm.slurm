@@ -16,9 +16,9 @@
 #SBATCH -n 1 #tasks
 #SBATCH --mem=40G
 #SBATCH --time=0-23:59:00
-#SBATCH --gres=gpu:a100l:1
-#SBATCH --partition=main
-#SBATCH --cpus-per-task=8
+#SBATCH --gres=gpu:l40s:1
+#SBATCH --partition=long
+#SBATCH --cpus-per-task=16
 
 # Submit jobs.
 module purge
@@ -39,8 +39,11 @@ CMD="CUDA_VISIBLE_DEVICES=0 python ppomix_lstm.py \
     alg.NUM_EPOCHS=${PPO_EPOCHS} \
     alg.LR=${LR} \
     alg.ENT_COEFF=${ENT} \
-    alg.NUM_ENVS=1024 \
-    alg.ENV_NAME=Gravitar-v5"
+    alg.NUM_ENVS=512 \
+    alg.NUM_AGENTS=1 \
+    alg.NUM_STEPS=32 \
+    alg.MIXING_STEPS=99999999 \
+    alg.ENV_NAME=MontezumaRevenge-v5"
 
 # Print the full command for debugging
 stdbuf -o0 echo "Executing command: $CMD"
