@@ -2,10 +2,10 @@ import subprocess
 import re
 import os
 ### Utils ###
-def gen_script(python_command):
+def gen_script(python_command, compute_type):
     script = (
         "#!/bin/bash\n"
-        
+        "module load httpproxy" if 'rorqual' in compute_type else ""
         "source ./load_env.sh\n"
         f"{python_command}"
     )
@@ -22,6 +22,8 @@ def get_compute_command(compute_type: str = "l40s", job_name: str = 'meltingpot_
         base = 'sbatch  --time=12:0:0  --gres=gpu:a100l:1 --partition=main --cpus-per-task=4 --mem=32G'
     elif compute_type == "short":
         base = 'sbatch  --time=3:0:0  --gres=gpu:a100l:4 --partition=short-unkillable --cpus-per-task=64 --mem=128G'
+    elif compute_type == "h100_rorqual_12h":
+        base = 'sbatch --time=12:0:0 --gpus-per-node=h100:1 --cpus-per-task=12 --mem=250G --account=def-bengioy'
     else:
         raise ValueError(f"Invalid Compute Type: {compute_type}")
     
@@ -41,7 +43,7 @@ def get_compute_command(compute_type: str = "l40s", job_name: str = 'meltingpot_
 
 
 def submit_slurm_job(python_command, fake_submit: bool = True, compute_type: str = "l40s", dependency_job_id: str = None, job_name: str = None):
-    script = gen_script(python_command)
+    script = gen_script(python_command, compute_type)
     print('-'*100)
     print('##SCRIPT##\n', script)
     with open('sweep_temp_job.sh', 'w') as f:
