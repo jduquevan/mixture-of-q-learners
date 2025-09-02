@@ -10,9 +10,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from functools import partial
-from typing import Any, Optional, Union, Callable
-from chex import Array, Scalar
-from typing_extensions import Self
+from typing import Any
 
 from flax import struct
 import chex
@@ -29,11 +27,15 @@ import gym
 import numpy as np
 from packaging import version
 from functools import partial
+from typing import Union, Optional
+from chex import Array, Scalar
+from typing import Callable
 import functools
+
+MetricFn = Callable[[Array, Array], Array]
 
 is_legacy_gym = version.parse(gym.__version__) < version.parse("0.26.0")
 assert is_legacy_gym, "Current version supports only gym<=0.23.1"
-MetricFn = Callable[[Array, Array], Array]
 
 # code for the episodic intrinsic reward computation is taken from https://github.com/google-deepmind/rlax/blob/master/rlax/_src/exploration.py#L155#L300 and 
 # https://github.com/google-deepmind/rlax/blob/master/rlax/_src/episodic_memory.py
@@ -449,25 +451,69 @@ class CNN(nn.Module):
         x = nn.relu(x)
         return x
 
+class MaskedLSTMCell(nn.Module):
+    features: int
+    def setup(self):
+        self.cell = nn.LSTMCell(features=self.features)
+
+    def __call__(self, carry, inputs):
+        (c, h) = carry                       # (B,H)
+        x_t, m_t = inputs                    # x_t: (B,F), m_t: (B,)
+        m_t = m_t[:, None]                   # (B,1)
+        carry = (c * m_t, h * m_t)           # reset where episode ended
+        return self.cell(carry, x_t)
+
 class QNetwork(nn.Module):
     action_dim: int
     norm_type: str = "layer_norm"
     norm_input: bool = False
+    hidden_size: int = 256
+
+    def setup(self):
+        self.lstm_scan = nn.scan(
+            MaskedLSTMCell,
+            variable_broadcast="params",
+            split_rngs={"params": False},
+            in_axes=1, out_axes=1
+        )(features=self.hidden_size)
 
     @nn.compact
-    def __call__(self, x: jnp.ndarray, train: bool):
-        x = jnp.transpose(x, (0, 2, 3, 1))
+    def __call__(self, x: jnp.ndarray, carry, train: bool, dones: jnp.ndarray | None = None):
+        if x.ndim == 4:                        # (B,C,H,W) -> (B,H,W,C)
+            x = jnp.transpose(x, (0, 2, 3, 1))
+        elif x.ndim == 5:                      # (B,T,C,H,W) -> (B*T,H,W,C)
+            B, T, C, H, W = x.shape
+            x = jnp.transpose(x, (0, 1, 3, 4, 2))      # (B,T,H,W,C)
+            x = x.reshape(B * T, H, W, C)
+        
         if self.norm_input:
             x = nn.BatchNorm(use_running_average=not train)(x)
         else:
             # dummy normalize input for global compatibility
             x_dummy = nn.BatchNorm(use_running_average=not train)(x)
             x = x / 255.0
-        x = CNN(norm_type=self.norm_type)(x, train)
-        x = nn.Dense(self.action_dim)(x)
-        return x
-    
-    
+        feat = CNN(norm_type=self.norm_type)(x, train)
+
+        if dones is None:
+            B = feat.shape[0]
+            feat = feat[:, None, :]                          # (B,1,F)
+            masks = jnp.ones((B, 1), jnp.float32)            # (B,1)
+            (cT, hT), ys = self.lstm_scan(carry, (feat, masks))   # ys: (B,1,H)
+            out = ys[:, 0, :]                                # (B,H)
+        else:
+            B = dones.shape[0]
+            T = dones.shape[1]
+            feat = feat.reshape(B, T, -1)                    # (B,T,F)
+            masks = jnp.concatenate(
+                [jnp.ones((B, 1), jnp.float32), 1.0 - dones[:, :-1].astype(jnp.float32)],
+                axis=1
+            )                                                # (B,T)
+            (cT, hT), out = self.lstm_scan(carry, (feat, masks))  # out: (B,T,H)
+
+        x = nn.Dense(self.action_dim)(out)
+        return x, (cT, hT)
+
+
 class INVCNN(nn.Module):
     @nn.compact
     def __call__(self, x: jnp.ndarray, train: bool):
@@ -582,6 +628,10 @@ class Transition:
     rnd_error: chex.Array
     rnd_alpha: chex.Array
 
+@struct.dataclass
+class RNNState:
+    c: jnp.ndarray
+    h: jnp.ndarray
 
 class CustomTrainState(TrainState):
     batch_stats: Any
@@ -684,6 +734,9 @@ def make_train(config):
         lr = lr_scheduler if config.get("LR_LINEAR_DECAY", False) else config["LR"]
 
         # INIT NETWORK AND OPTIMIZER
+        h_0 = jnp.zeros((config["NUM_ENVS"] + config["TEST_ENVS"], config["HIDDEN_SIZE"]), jnp.float32)
+        c_0 = jnp.zeros_like(h_0)
+
         network = QNetwork(
             action_dim=env.single_action_space.n,
             norm_type=config["NORM_TYPE"],
@@ -696,14 +749,16 @@ def make_train(config):
         
         rnd_network = RNDNetwork()
 
-        def create_agent(rng):
+        def create_agent(rng, c_0, h_0):
             init_x = jnp.zeros((1, *env.single_observation_space.shape))
+            
             if config["SCALE_FACTOR"] > 1:
                 init_x = nearest_neighbor_upscale(init_x, scale_factor=config["SCALE_FACTOR"])
-            network_variables = network.init(rng, init_x, train=False)
+
+            network_variables = network.init(rng, init_x, (c_0, h_0),  train=False)
             inv_network_variables = inv_network.init(rng, init_x, init_x, train=False)
             rnd_network_variables = rnd_network.init(rng, init_x, train=False)
-
+            
             # Q NETWORK
             tx = optax.chain(
                 optax.clip_by_global_norm(config["MAX_GRAD_NORM"]),
@@ -742,11 +797,11 @@ def make_train(config):
                 batch_stats=None,
                 tx=rnd_tx,
             )
-            
             return train_state, inv_train_state, rnd_train_state
 
         rng, _rng = jax.random.split(rng)
-        train_state, inv_train_state, rnd_train_state = create_agent(rng)
+        train_state, inv_train_state, rnd_train_state = create_agent(rng, c_0, h_0)
+        rnn_state = RNNState(c=c_0, h=h_0)
         
         NUM_TOTAL_ENVS = config["NUM_ENVS"]
         if config.get("TEST_DURING_TRAINING", False):
@@ -755,22 +810,26 @@ def make_train(config):
         eir_state = jax.vmap(lambda _: init_eir_state(max_memory_size=config["NGU"]["MAX_MEMORY_SIZE"],  # FIXME: note that currently this does not reset when environment finishes, we can still use it for now but this is not ideal
                                    num_neighbors=config["NGU"]["NUM_NEIGHBORS"],
                                    feature_dim=32))(jnp.arange(NUM_TOTAL_ENVS)) # This comes from the head of the INVCNN
-        
 
-        ##### PQN LOOP #####
+        # TRAINING LOOP
         def _update_step(runner_state, unused):
             train_state, inv_train_state, rnd_train_state, eir_state, expl_state, test_metrics, rng = runner_state
+            _, _, initial_rnn_state = expl_state
+            c_initial, h_initial = initial_rnn_state.c, initial_rnn_state.h
 
-            ##### SAMPLE ENV #####
+            # SAMPLE PHASE
             def _step_env(carry, _):
-                last_obs, env_state, rng = carry
+                last_obs, env_state, rnn_state, rng = carry
                 rng, rng_a, rng_s = jax.random.split(rng, 3)
-                q_vals = network.apply(
+                c, h = rnn_state.c, rnn_state.h
+
+                q_vals, (c_new, h_new) = network.apply(
                     {
                         "params": train_state.params,
                         "batch_stats": train_state.batch_stats,
                     },
                     last_obs,
+                    (c, h),
                     train=False,
                 )
 
@@ -792,20 +851,26 @@ def make_train(config):
                 
                 rnd_error = rnd_network.apply({"params": rnd_train_state.params,}, new_obs, train=False)
 
+                # ── mask new carry --------------------------------------------------------
+                mask = (1. - new_done).reshape((-1, 1))
+                h_next = h_new * mask
+                c_next = c_new * mask
+                next_rnn_state = RNNState(h=h_next, c=c_next)
+
                 transition = Transition(
                     obs=last_obs,
                     action=new_action,
-                    reward=-int(1e9), # we'll fill reward later, however, we want it to show up in the logs if we forget to fill it
+                    reward=config.get("REW_SCALE", 1) * reward,
                     done=new_done,
                     next_obs=new_obs,
-                    next_obs_inv_features=inv_features,
                     q_val=q_vals,
+                    next_obs_inv_features=inv_features,
                     original_reward=reward,
                     eir_reward=-int(1e9), # we'll fill eir_reward later, however, we want it to show up in the logs if we forget to fill it
                     rnd_error=rnd_error,
                     rnd_alpha=-int(1e9), # we'll fill rnd_alpha later, however, we want it to show up in the logs if we forget to fill it
                 )
-                return (new_obs, new_env_state, rng), (transition, info)
+                return (new_obs, new_env_state, next_rnn_state, rng), (transition, info)
 
             # step the env
             rng, _rng = jax.random.split(rng)
@@ -816,14 +881,15 @@ def make_train(config):
                 config["NUM_STEPS"],
             )
             expl_state = tuple(expl_state)
-            
+
+                
             #--- calculating novelty rewards ---#    
             inv_features = transitions.next_obs_inv_features.transpose(1, 0, 2)
             eir_state, eir_rewards = jax.vmap(lambda f, s: compute_eir(f, s, config["NGU"]["NUM_NEIGHBORS"], config["NGU"]["MAX_MEMORY_SIZE"]))(inv_features, eir_state)
             eir_rewards = eir_rewards.transpose(1, 0) # tranpose from (num_envs, num_steps) to (num_steps, num_envs)
             
             rnd_alpha = 1 + (transitions.rnd_error - transitions.rnd_error.mean()) / (transitions.rnd_error.std() + 1e-3) #FIXME: this is a crude heuristic and different from the never give up paper
-            rnd_alpha = jnp.clip(rnd_alpha, a_min=0, a_max=config["NGU"]["L"]) # this refers to the L in never give up paper
+            rnd_alpha = jnp.clip(rnd_alpha, a_min=0, a_max=config["NGU"]["L"])
             
             training_reward = transitions.original_reward * config.get("REW_SCALE", 1) + eir_rewards * rnd_alpha * config["NGU"]["BETA"]
             
@@ -831,25 +897,34 @@ def make_train(config):
                                               reward=training_reward,
                                               rnd_alpha=rnd_alpha)
             
-            
-
             if config.get("TEST_DURING_TRAINING", False):
                 # remove testing envs
                 transitions = jax.tree.map(
                     lambda x: x[:, : -config["TEST_ENVS"]], transitions
                 )
+                c_initial = c_initial[: -config["TEST_ENVS"], :]
+                h_initial = h_initial[: -config["TEST_ENVS"], :]
 
             train_state = train_state.replace(
                 timesteps=train_state.timesteps
                 + config["NUM_STEPS"] * config["NUM_ENVS"]
             )  # update timesteps count
 
-            last_q_vals = network.apply(
+            rnn_T = expl_state[2]  # RNN state AFTER T environment steps
+            if config.get("TEST_DURING_TRAINING", False) and config["TEST_ENVS"] > 0:
+                last_c = rnn_T.c[: -config["TEST_ENVS"], :]
+                last_h = rnn_T.h[: -config["TEST_ENVS"], :]
+            else:
+                last_c = rnn_T.c
+                last_h = rnn_T.h
+
+            last_q_vals, (_, _) = network.apply(
                 {
                     "params": train_state.params,
                     "batch_stats": train_state.batch_stats,
                 },
                 transitions.next_obs[-1],
+                (last_c, last_h),
                 train=False,
             )
             if config["IS_SARSA"] is False:
@@ -898,13 +973,15 @@ def make_train(config):
 
                 def _learn_phase(carry, minibatch_and_target):
                     train_state, rng = carry
-                    minibatch, target = minibatch_and_target
+                    minibatch, target, c_init, h_init = minibatch_and_target
 
                     def _loss_fn(params):
-                        q_vals, updates = network.apply(
+                        (q_vals, _), updates = network.apply(
                             {"params": params, "batch_stats": train_state.batch_stats},
                             minibatch.obs,
+                            (c_init, h_init),
                             train=True,
+                            dones=minibatch.done,
                             mutable=["batch_stats"],
                         )  # (batch_size*2, num_actions)
 
@@ -929,12 +1006,20 @@ def make_train(config):
                     return (train_state, rng), (loss, qvals)
 
                 def preprocess_transition(x, rng):
-                    x = x.reshape(
-                        -1, *x.shape[2:]
-                    )  # num_steps*num_envs (batch_size), ...
+                    num_minibatches = config["NUM_MINIBATCHES"]
+
+                    x = jnp.transpose(x, (1, 0) + tuple(range(2, x.ndim)))
                     x = jax.random.permutation(rng, x)  # shuffle the transitions
                     x = x.reshape(
-                        config["NUM_MINIBATCHES"], -1, *x.shape[1:]
+                        (num_minibatches, -1) + x.shape[1:] 
+                    )  # num_mini_updates, batch_size/num_mini_updates, ...
+                    return x
+
+                def preprocess_hidden(x, rng):
+                    num_minibatches = config["NUM_MINIBATCHES"]
+                    x = jax.random.permutation(rng, x)
+                    x = x.reshape(
+                        (num_minibatches, -1) + x.shape[1:] 
                     )  # num_mini_updates, batch_size/num_mini_updates, ...
                     return x
 
@@ -945,10 +1030,16 @@ def make_train(config):
                 targets = jax.tree.map(
                     lambda x: preprocess_transition(x, _rng), lambda_targets
                 )
+                initial_h = jax.tree.map(
+                    lambda x: preprocess_hidden(x, _rng), h_initial
+                )
+                initial_c = jax.tree.map(
+                    lambda x: preprocess_hidden(x, _rng), c_initial
+                )
 
                 rng, _rng = jax.random.split(rng)
                 (train_state, rng), (loss, qvals) = jax.lax.scan(
-                    _learn_phase, (train_state, rng), (minibatches, targets)
+                    _learn_phase, (train_state, rng), (minibatches, targets, initial_h, initial_c)
                 )
 
                 return (train_state, rng), (loss, qvals)
@@ -1082,7 +1173,7 @@ def make_train(config):
                 _learn_epoch_rnd, (rnd_train_state, rng), None, config["NUM_EPOCHS"]
             )
 
-            rnd_train_state = rnd_train_state.replace(n_updates=rnd_train_state.n_updates + 1)            
+            rnd_train_state = rnd_train_state.replace(n_updates=rnd_train_state.n_updates + 1) 
             
             ##### LOGGING #####
 
@@ -1116,6 +1207,10 @@ def make_train(config):
                 "std_original_reward": transitions.original_reward.std(),
                 "max_original_reward": transitions.original_reward.max(),
                 "min_original_reward": transitions.original_reward.min(),
+                "mean_rnd_error": transitions.rnd_error.mean(),
+                "std_rnd_error": transitions.rnd_error.std(),
+                "max_rnd_error": transitions.rnd_error.max(),
+                "min_rnd_error": transitions.rnd_error.min(),
                 "inv_loss": inv_loss.mean(),
                 "rnd_loss": rnd_loss.mean(),
             }
@@ -1149,7 +1244,7 @@ def make_train(config):
 
         # train
         rng, _rng = jax.random.split(rng)
-        expl_state = (init_obs, env_state)
+        expl_state = (init_obs, env_state, rnn_state)
         runner_state = (train_state, inv_train_state, rnd_train_state, eir_state, expl_state, test_metrics, _rng)
 
         runner_state, metrics = jax.lax.scan(
