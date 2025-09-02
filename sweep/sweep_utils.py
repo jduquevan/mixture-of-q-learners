@@ -5,10 +5,14 @@ import os
 def gen_script(python_command, compute_type):
     script = (
         "#!/bin/bash\n"
-        "module load httpproxy" if 'rorqual' in compute_type else ""
         "source ./load_env.sh\n"
-        f"{python_command}"
     )
+    
+    # add httpproxy for compute canada
+    if 'rorqual' in compute_type:
+        script += "module load httpproxy\n"
+    
+    script += f"{python_command}"
     return script
 
 def get_compute_command(compute_type: str = "l40s", job_name: str = 'meltingpot_default', dependency_job_id: str = None):

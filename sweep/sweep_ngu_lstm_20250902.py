@@ -1,7 +1,7 @@
 from sweep_utils import submit_slurm_job, get_compute_command
 ### Jobs ###
-BASE_RUN_ID = "20250901_pqn_atari_ngu"
-BASE_PYTHON_COMMAND = "python purejaxql/pqn_atari_ngu.py" \
+BASE_RUN_ID = "20250902_pqn_atari_lstm_ngu"
+BASE_PYTHON_COMMAND = "python purejaxql/pqn_atari_lstm_ngu.py" \
             " RUN_ID={run_id}" \
             " WANDB_TAGS={wandb_tags}" \
             " SEED={seed}" \
@@ -38,9 +38,9 @@ def get_job(env_name: str,
 
 def get_jobs():
     jobs = {
-        'montezuma_ngu_400x400_512envs_0136eps_01beta': get_job(env_name='MontezumaRevenge-v5', num_envs=512, img_size=400, total_timesteps=25e7, eps_finish=0.0136, beta=0.01),
-        'pitfall_ngu_400x400_512envs_0136eps_01beta': get_job(env_name='Pitfall-v5', num_envs=512, img_size=400, total_timesteps=25e7, eps_finish=0.0136, beta=0.01),
-        'pitfall_ngu_400x400_512envs_03eps_01beta': get_job(env_name='Pitfall-v5', num_envs=512, img_size=400, total_timesteps=25e7, eps_finish=0.03, beta=0.01),
+        'montezuma_ngu_160x160_512envs_0136eps_01beta': get_job(env_name='MontezumaRevenge-v5', num_envs=512, img_size=160, total_timesteps=25e7, eps_finish=0.0136, beta=0.01),
+        'pitfall_ngu_160x160_512envs_0136eps_01beta': get_job(env_name='Pitfall-v5', num_envs=512, img_size=160, total_timesteps=25e7, eps_finish=0.0136, beta=0.01),
+        'pitfall_ngu_160x160_512envs_03eps_01beta': get_job(env_name='Pitfall-v5', num_envs=512, img_size=160, total_timesteps=25e7, eps_finish=0.03, beta=0.01),
     }
     
     return jobs

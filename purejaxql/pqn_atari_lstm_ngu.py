@@ -515,8 +515,17 @@ class QNetwork(nn.Module):
 
 
 class INVCNN(nn.Module):
+    norm_type: str = "layer_norm"
+
     @nn.compact
     def __call__(self, x: jnp.ndarray, train: bool):
+        if self.norm_type == "layer_norm":
+            normalize = lambda x: nn.LayerNorm()(x)
+        elif self.norm_type == "batch_norm":
+            normalize = lambda x: nn.BatchNorm(use_running_average=not train)(x)
+        else:
+            normalize = lambda x: x
+            
         x = x / 255.0
         x = nn.Conv(
             32,
@@ -524,6 +533,7 @@ class INVCNN(nn.Module):
             strides=(4, 4),
             padding="VALID",
         )(x)
+        x = normalize(x)
         x = nn.relu(x)
         x = nn.Conv(
             64,
@@ -531,6 +541,7 @@ class INVCNN(nn.Module):
             strides=(2, 2),
             padding="VALID",
         )(x)
+        x = normalize(x)
         x = nn.relu(x)
         x = nn.Conv(
             64,
@@ -538,9 +549,11 @@ class INVCNN(nn.Module):
             strides=(1, 1),
             padding="VALID",
         )(x)
+        x = normalize(x)
         x = nn.relu(x)
         x = x.reshape((x.shape[0], -1))
         x = nn.Dense(32)(x)
+        x = normalize(x)
         x = nn.relu(x)
         return x
     
@@ -1183,6 +1196,7 @@ def make_train(config):
                 infos.update({"test_" + k: v for k, v in test_infos.items()})
 
             metrics = {
+                "epislon": eps_scheduler(train_state.n_updates),
                 "env_step": train_state.timesteps,
                 "update_steps": train_state.n_updates,
                 "env_frame": train_state.timesteps
