@@ -449,39 +449,6 @@ class CNN(nn.Module):
         x = nn.relu(x)
         return x
 
-class INVCNN(nn.Module):
-    @nn.compact
-    def __call__(self, x: jnp.ndarray, train: bool):
-        x = nn.Conv(
-            32,
-            kernel_size=(8, 8),
-            strides=(4, 4),
-            padding="VALID",
-            kernel_init=nn.initializers.he_normal(),
-        )(x)
-        x = nn.relu(x)
-        x = nn.Conv(
-            64,
-            kernel_size=(4, 4),
-            strides=(2, 2),
-            padding="VALID",
-            kernel_init=nn.initializers.he_normal(),
-        )(x)
-        x = nn.relu(x)
-        x = nn.Conv(
-            64,
-            kernel_size=(3, 3),
-            strides=(1, 1),
-            padding="VALID",
-            kernel_init=nn.initializers.he_normal(),
-        )(x)
-        x = nn.relu(x)
-        x = x.reshape((x.shape[0], -1))
-        x = nn.Dense(32, kernel_init=nn.initializers.he_normal())(x)
-        x = nn.relu(x)
-        return x
-
-
 class QNetwork(nn.Module):
     action_dim: int
     norm_type: str = "layer_norm"
@@ -510,7 +477,6 @@ class INVCNN(nn.Module):
             kernel_size=(8, 8),
             strides=(4, 4),
             padding="VALID",
-            kernel_init=nn.initializers.he_normal(),
         )(x)
         x = nn.relu(x)
         x = nn.Conv(
@@ -518,7 +484,6 @@ class INVCNN(nn.Module):
             kernel_size=(4, 4),
             strides=(2, 2),
             padding="VALID",
-            kernel_init=nn.initializers.he_normal(),
         )(x)
         x = nn.relu(x)
         x = nn.Conv(
@@ -526,11 +491,10 @@ class INVCNN(nn.Module):
             kernel_size=(3, 3),
             strides=(1, 1),
             padding="VALID",
-            kernel_init=nn.initializers.he_normal(),
         )(x)
         x = nn.relu(x)
         x = x.reshape((x.shape[0], -1))
-        x = nn.Dense(32, kernel_init=nn.initializers.he_normal())(x)
+        x = nn.Dense(32)(x)
         x = nn.relu(x)
         return x
     
@@ -619,7 +583,7 @@ class Transition:
     eir_reward: chex.Array
     next_obs_inv_features: chex.Array
     rnd_error: chex.Array
-    rnd_reward: chex.Array
+    rnd_alpha: chex.Array
 
 
 class CustomTrainState(TrainState):
@@ -743,6 +707,7 @@ def make_train(config):
             inv_network_variables = inv_network.init(rng, init_x, init_x, train=False)
             rnd_network_variables = rnd_network.init(rng, init_x, train=False)
 
+            # Q NETWORK
             tx = optax.chain(
                 optax.clip_by_global_norm(config["MAX_GRAD_NORM"]),
                 optax.radam(learning_rate=lr),
@@ -756,18 +721,29 @@ def make_train(config):
             )
             
             assert "batch_stats" not in inv_network_variables, "our inverse dynamic network does not have such thing as described in the never give up paper"
+            
+            # INV NETWORK
+            inv_tx = optax.chain(
+                optax.clip_by_global_norm(config["MAX_GRAD_NORM"]),
+                optax.radam(learning_rate=config["NGU"]["INV_LR"]),
+            )
             inv_train_state = CustomTrainState.create(
                 apply_fn=inv_network.apply,
                 params=inv_network_variables["params"],
                 batch_stats=None,
-                tx=tx,
+                tx=inv_tx,
             )
             
+            # RND NETWORK
+            rnd_tx = optax.chain(
+                optax.clip_by_global_norm(config["MAX_GRAD_NORM"]),
+                optax.radam(learning_rate=config["NGU"]["RND_LR"]),
+            )
             rnd_train_state = CustomTrainState.create(
                 apply_fn=rnd_network.apply,
                 params=rnd_network_variables["params"],
                 batch_stats=None,
-                tx=tx,
+                tx=rnd_tx,
             )
             
             return train_state, inv_train_state, rnd_train_state
@@ -830,7 +806,7 @@ def make_train(config):
                     original_reward=reward,
                     eir_reward=-int(1e9), # we'll fill eir_reward later, however, we want it to show up in the logs if we forget to fill it
                     rnd_error=rnd_error,
-                    rnd_reward=-int(1e9), # we'll fill rnd_reward later, however, we want it to show up in the logs if we forget to fill it
+                    rnd_alpha=-int(1e9), # we'll fill rnd_alpha later, however, we want it to show up in the logs if we forget to fill it
                 )
                 return (new_obs, new_env_state, rng), (transition, info)
 
@@ -844,12 +820,21 @@ def make_train(config):
             )
             expl_state = tuple(expl_state)
             
+            #--- calculating novelty rewards ---#    
             inv_features = transitions.next_obs_inv_features.transpose(1, 0, 2)
             eir_state, eir_rewards = jax.vmap(lambda f, s: compute_eir(f, s, config["NGU"]["NUM_NEIGHBORS"], config["NGU"]["MAX_MEMORY_SIZE"]))(inv_features, eir_state)
             eir_rewards = eir_rewards.transpose(1, 0) # tranpose from (num_envs, num_steps) to (num_steps, num_envs)
-            rnd_rewards = 1 + (transitions.rnd_error - transitions.rnd_error.mean()) / (transitions.rnd_error.std() + 1e-3) #FIXME: this is a crude heuristic and different from the never give up paper
-            training_reward = transitions.original_reward * config.get("REW_SCALE", 1) + eir_rewards * rnd_rewards * config["NGU"]["NGU_REWARD_SCALE"]
-            transitions = transitions.replace(eir_reward=eir_rewards, reward=training_reward)
+            
+            rnd_alpha = 1 + (transitions.rnd_error - transitions.rnd_error.mean()) / (transitions.rnd_error.std() + 1e-3) #FIXME: this is a crude heuristic and different from the never give up paper
+            rnd_alpha = jnp.clip(rnd_alpha, a_min=0, a_max=config["NGU"]["L"]) # this refers to the L in never give up paper
+            
+            training_reward = transitions.original_reward * config.get("REW_SCALE", 1) + eir_rewards * rnd_alpha * config["NGU"]["BETA"]
+            
+            transitions = transitions.replace(eir_reward=eir_rewards,
+                                              reward=training_reward,
+                                              rnd_alpha=rnd_alpha)
+            
+            
 
             if config.get("TEST_DURING_TRAINING", False):
                 # remove testing envs
@@ -1126,6 +1111,10 @@ def make_train(config):
                 "std_eir_reward": transitions.eir_reward.std(),
                 "max_eir_reward": transitions.eir_reward.max(),
                 "min_eir_reward": transitions.eir_reward.min(),
+                "mean_rnd_alpha": transitions.rnd_alpha.mean(),
+                "std_rnd_alpha": transitions.rnd_alpha.std(),
+                "max_rnd_alpha": transitions.rnd_alpha.max(),
+                "min_rnd_alpha": transitions.rnd_alpha.min(),
                 "mean_original_reward": transitions.original_reward.mean(),
                 "std_original_reward": transitions.original_reward.std(),
                 "max_original_reward": transitions.original_reward.max(),

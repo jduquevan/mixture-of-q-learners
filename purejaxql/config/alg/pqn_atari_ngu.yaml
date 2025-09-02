@@ -18,7 +18,7 @@ LAMBDA: 0.65
 # env specific, see https://envpool.readthedocs.io/en/latest/env/atari.html
 ENV_NAME: "Pong-v5"
 ENV_KWARGS: 
-  episodic_life: True # lost life -> done, increases sample efficiency, may hurt in some games
+  episodic_life: False # lost life -> done, increases sample efficiency, may hurt in some games
   reward_clip: True # reward into -1, 1
   repeat_action_probability: 0. # sticky actions
   frame_skip: 4
@@ -28,14 +28,14 @@ ENV_KWARGS:
 TEST_DURING_TRAINING: True 
 TEST_ENVS: 8
 EPS_TEST: 0. # 0 for greedy test policy
-CURIOSITY_REWARD: "DISABLED"
-CURIOSITY_REWARD_SCALE: 10000000.0 # so it totally messes training if enabled wrongly
 REW_SCALE: 1.0
 SCALE_FACTOR: 1
 IS_SARSA: False
-GRAD_ACCUM_STEPS: 1
 
 NGU:
   MAX_MEMORY_SIZE: 5000
   NUM_NEIGHBORS: 5
-  NGU_REWARD_SCALE: 1.0
+  BETA: 0.001
+  L: 5
+  INV_LR: 0.0005
+  RND_LR: 0.0005
