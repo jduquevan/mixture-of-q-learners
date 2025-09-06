@@ -1,9 +1,9 @@
 #!/bin/bash
 
 source load_env.sh
-python purejaxql/pqn_atari_ngu.py \
-    RUN_ID=test_ngu_4 \
-    DEBUG=1 \
+python purejaxql/pqn_atari_lstm_ngu.py \
+    RUN_ID=test_lstm_ngu_11 \
+    DEBUG=0\
     WANDB_TAGS=[test_ngu_pitfall] \
     SEED=42 \
     cluster@_global_=milad_mila \
@@ -14,4 +14,5 @@ python purejaxql/pqn_atari_ngu.py \
     +alg.ENV_KWARGS.img_height=160 \
     alg.TOTAL_TIMESTEPS=250000000.0 \
     alg.EPS_FINISH=0.01 \
-    alg.IS_SARSA=False
+    alg.IS_SARSA=False \
+    +alg.HIDDEN_SIZE=256
