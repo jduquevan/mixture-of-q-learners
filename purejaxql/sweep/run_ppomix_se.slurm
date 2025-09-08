@@ -33,6 +33,7 @@ SEED=${1}
 ENT=${2}
 DIV=${3}
 MSTEPS=${4}
+ACCUM_STEPS=${5}
 
 # Construct the full command
 CMD="python ppomix_se.py \
@@ -40,6 +41,7 @@ CMD="python ppomix_se.py \
     alg.ENT_COEFF=${ENT} \
     alg.DIVERSITY_COEFF=${DIV} \
     alg.MIXING_STEPS=${MSTEPS} \
+    alg.ACCUM_STEPS=${ACCUM_STEPS} \
     alg.NUM_ENVS=128 \
     alg.NUM_AGENTS=4 \
     alg.ENV_NAME=Gravitar-v5"

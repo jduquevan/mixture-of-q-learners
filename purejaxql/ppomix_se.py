@@ -380,29 +380,51 @@ def initialize_agents(config, env, rng, network):
     )(jax.random.split(rng, config["NUM_AGENTS"]))
 
 
-    lr_sched = optax.linear_schedule(
-        init_value=config["LR"],
-        end_value=1e-20,
-        transition_steps=config["NUM_UPDATES_DECAY"]
-                       * config["NUM_MINIBATCHES"]
-                       * config["NUM_EPOCHS"],
-    ) if config.get("LR_LINEAR_DECAY", False) else config["LR"]
+    # --- Gradient accumulation knob (default 1 = off)
+    accum_k: int = int(config.get("ACCUM_STEPS", 1))
 
-    tx = lambda lr: optax.chain(
-        optax.clip_by_global_norm(config["MAX_GRAD_NORM"]),
-        optax.radam(lr),
+    _transition_steps = (
+        config["NUM_UPDATES_DECAY"]
+        * config["NUM_MINIBATCHES"]
+        * config["NUM_EPOCHS"]
     )
+    if accum_k > 1:
+        _transition_steps = max(1, _transition_steps // accum_k)
+
+    lr_sched = (
+        optax.linear_schedule(
+            init_value=config["LR"],
+            end_value=1e-20,
+            transition_steps=_transition_steps,
+        )
+        if config.get("LR_LINEAR_DECAY", False)
+        else config["LR"]
+    )
+
+    def make_tx(lr):
+        if accum_k > 1:
+            return optax.chain(
+                optax.apply_every(k=accum_k),              # sum k micro-grads in opt state
+                optax.scale(1.0 / accum_k),                # turn sum into mean
+                optax.clip_by_global_norm(config["MAX_GRAD_NORM"]),
+                optax.radam(lr),
+            )
+        else:
+            return optax.chain(
+                optax.clip_by_global_norm(config["MAX_GRAD_NORM"]),
+                optax.radam(lr),
+            )
 
     encoder_states = EncoderState.create(
         apply_fn=network.apply,
         params=encoder_params,
-        tx=tx(lr_sched),
+        tx=make_tx(lr_sched),
     )
 
     critic_states = CriticState.create(
         apply_fn=network.apply, 
         params=critic_params,
-        tx=tx(lr_sched),
+        tx=make_tx(lr_sched),
     )
 
     critic_states = critic_states.replace(
@@ -418,7 +440,7 @@ def initialize_agents(config, env, rng, network):
             ActorState.create(
                 apply_fn=network.apply, 
                 params=_index(actor_params,  i),
-                tx=tx(lr_sched),
+                tx=make_tx(lr_sched),
             )
         )
 
