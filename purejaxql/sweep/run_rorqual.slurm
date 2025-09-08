@@ -18,7 +18,7 @@
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=40G
 #SBATCH --time=0-23:59:00   
-#SBATCH --gpus=nvidia_h100_80gb_hbm3_3g.40gb:1
+#SBATCH --gpus=h100:1
 
 # Submit jobs.
 cd /project/rrg-bengioy-ad/jduque/mixture-of-q-learners
