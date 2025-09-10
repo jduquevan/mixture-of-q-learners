@@ -37,6 +37,7 @@ DIV=${3}
 MSTEPS=${4}
 TAU=${5}
 LR=${6}
+ACCUM_STEPS=${7}
 
 # Construct the full command
 CMD="CUDA_VISIBLE_DEVICES=0 python  /project/rrg-bengioy-ad/jduque/mixture-of-q-learners/purejaxql/ppomix_se.py \
@@ -46,6 +47,7 @@ CMD="CUDA_VISIBLE_DEVICES=0 python  /project/rrg-bengioy-ad/jduque/mixture-of-q-
     alg.MIXING_STEPS=${MSTEPS} \
     alg.MIX_TAU=${TAU} \
     alg.LR=${LR} \
+    alg.ACCUM_STEPS=${ACCUM_STEPS} \
     alg.NUM_ENVS=128 \
     alg.NUM_AGENTS=4 \
     alg.ENV_NAME=Gravitar-v5"
