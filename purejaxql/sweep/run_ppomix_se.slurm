@@ -34,6 +34,7 @@ ENT=${2}
 DIV=${3}
 MSTEPS=${4}
 ACCUM_STEPS=${5}
+ENV_NAME=${5}
 
 # Construct the full command
 CMD="python ppomix_se.py \
@@ -44,7 +45,7 @@ CMD="python ppomix_se.py \
     alg.ACCUM_STEPS=${ACCUM_STEPS} \
     alg.NUM_ENVS=128 \
     alg.NUM_AGENTS=4 \
-    alg.ENV_NAME=Gravitar-v5"
+    alg.ENV_NAME=${ENV_NAME}"
 
 # Print the full command for debugging
 stdbuf -o0 echo "Executing command: $CMD"

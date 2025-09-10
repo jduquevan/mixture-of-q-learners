@@ -688,7 +688,25 @@ def make_train(config):
                     div_coef = config.get("DIVERSITY_COEFF", 0.0) * (A > 1)
                     cross_entropy_mask = jnp.tril(jnp.ones((A, A)))
 
-                    def agent_loss_and_update(cts, ats, minibatch, target, ets, logprobs_all, adv_i, i, ce_mask):
+                    CROSS_ON   = bool(config.get("CROSS_AGENT_REUSE", False))
+                    CROSS_COEF = float(config.get("CROSS_COEF", 0.25))
+                    CROSS_S    = int(config.get("CROSS_SAMPLES", 64))
+                    RHO_MAX    = float(config.get("CROSS_RHO_MAX", 10.0))
+
+                    # Shapes: (A, B, ...)
+                    flat_obs   = minibatch.obs.reshape(A * B, *minibatch.obs.shape[2:])
+                    flat_act   = minibatch.action.reshape(A * B, *minibatch.action.shape[2:])
+                    flat_logp  = minibatch.log_p.reshape(A * B, 1).squeeze(-1)
+                    flat_adv   = advantage.reshape(A * B)
+                    flat_agent = jnp.repeat(jnp.arange(A, dtype=jnp.int32), B)
+
+                    # Per-agent RNG for cross sampling
+                    rng, rng_cross = jax.random.split(rng)
+                    rng_crosses = jax.random.split(rng_cross, A)
+
+                    def agent_loss_and_update(cts, ats, minibatch, target, ets, logprobs_all, adv_i, i, ce_mask,
+                          flat_obs, flat_act, flat_logp, flat_adv, flat_agent, rng_cross,
+                          CROSS_ON, CROSS_COEF, CROSS_S, RHO_MAX):
                         # Critic loss and update
                         def _critic_loss_fn(critic_params, encoder_params):
                             features = network.apply(
@@ -747,8 +765,42 @@ def make_train(config):
                             ce_mean = -jnp.mean(jnp.sum(probs_div * mean_logp_others, axis=-1))
 
                             # div_coef_i = jnp.where(is_exempt, 0.0, div_coef)
+                            cross_pg = 0.0
+                            if CROSS_ON and (CROSS_S > 0):
+                                # Sample from other agents' data
+                                mask = (flat_agent != i)
+                                # Sampling without replacement with a masked distribution
+                                probs = mask.astype(jnp.float32)
+                                probs = probs / (jnp.sum(probs) + 1e-8)
+                                idx = jax.random.choice(rng_cross, flat_obs.shape[0],
+                                                        shape=(CROSS_S,), replace=False, p=probs)
 
-                            loss = pg_loss + ent_coeff * ent_loss - div_coef * ce_mean
+                                obs_x   = flat_obs[idx]
+                                act_x   = flat_act[idx]
+                                logp_bx = flat_logp[idx]      # behavior log-prob at collect time
+                                adv_x   = flat_adv[idx]
+
+                                # Encode (grad flows to encoder + actor, like normal PPO)
+                                feat_x = network.apply({"params": ets.params},
+                                                    obs_x, train=True, method=ActorCritic.encode)
+
+                                logits_x = network.apply({"params": ats.params},
+                                                        feat_x, train=True, method=ActorCritic.actor)
+                                # current log pi_i(a|s)
+                                logp_all_x = logits_x - jax.scipy.special.logsumexp(logits_x, axis=-1, keepdims=True)
+                                logp_ix = jnp.take_along_axis(logp_all_x, act_x[..., None], -1).squeeze(-1)
+
+                                # IS ratio (clipped hard to reduce variance)
+                                ratio_x = jnp.exp(logp_ix - logp_bx)
+                                ratio_x = jnp.minimum(ratio_x, RHO_MAX)
+
+                                # PPO clipped surrogate on cross data
+                                clip_eps = config["CLIP_EPS"]
+                                unclipped_x = ratio_x * adv_x
+                                clipped_x   = jnp.clip(ratio_x, 1 - clip_eps, 1 + clip_eps) * adv_x
+                                cross_pg    = -jnp.mean(jnp.minimum(unclipped_x, clipped_x))
+
+                            loss = pg_loss + ent_coeff * ent_loss - div_coef * ce_mean + CROSS_COEF * cross_pg
                             aux  = {"entropy": jnp.mean(entropy), "kl": ce_mean}
                             return loss, aux
 
@@ -763,8 +815,16 @@ def make_train(config):
                         
                         return critic_loss, actor_loss, entropies, kl, ats, critic_grad, encoder_c_grad, encoder_a_grad
                     
-                    critic_loss, actor_loss, entropies, kls, new_actor_train_states, critic_grads, encoder_c_grad, encoder_a_grad = jax.vmap(agent_loss_and_update, in_axes=(None, 0,0,0, None, None,0,0,0))(
-                        critic_train_states, actor_train_states, minibatch, target, encoder_train_states, logprobs_all, advantage, agent_ids, cross_entropy_mask
+                    critic_loss, actor_loss, entropies, kls, new_actor_train_states, critic_grads, encoder_c_grad, encoder_a_grad = jax.vmap(
+                        agent_loss_and_update,
+                        in_axes=(None, 0, 0, 0, None, None, 0, 0, 0,
+                                None, None, None, None, None, 0,
+                                None, None, None, None)
+                    )(
+                        critic_train_states, actor_train_states, minibatch, target, encoder_train_states,
+                        logprobs_all, advantage, agent_ids, cross_entropy_mask,
+                        flat_obs, flat_act, flat_logp, flat_adv, flat_agent, rng_crosses,
+                        CROSS_ON, CROSS_COEF, CROSS_S, RHO_MAX
                     )
 
                     def mean_over_agents(tree): return jax.tree_map(lambda x: x.mean(0), tree)
