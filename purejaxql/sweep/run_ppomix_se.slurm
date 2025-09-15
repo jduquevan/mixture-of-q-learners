@@ -34,7 +34,7 @@ ENT=${2}
 DIV=${3}
 MSTEPS=${4}
 ACCUM_STEPS=${5}
-ENV_NAME=${5}
+ENV_NAME=${6}
 
 # Construct the full command
 CMD="python ppomix_se.py \

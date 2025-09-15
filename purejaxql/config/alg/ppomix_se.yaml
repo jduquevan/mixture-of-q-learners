@@ -15,18 +15,19 @@ NUM_AGENTS: 4
 CLIP_EPS: 0.1
 ENT_COEFF: 0.005
 DIVERSITY_COEFF: 0.005
-DIV_SAMPLES: 128
+DIV_SAMPLES: 512
+DIV_ADV_BETA: 1
 ACCUM_STEPS: 1
 
 # mixing
-MIXING_STEPS: 200            # every N PPO updates do a weighted merge
+MIXING_STEPS: 100            # every N PPO updates do a weighted merge
 EMA_ALPHA: 0.05
-MIX_TAU: 0.007
+MIX_TAU: 0.01
 
 # cross agent sample use
 CROSS_AGENT_REUSE: true      # turn on/off
-CROSS_COEF: 0.25             # weight of cross-agent PPO term
-CROSS_SAMPLES: 256            # per agent, per minibatch (drawn from others)
+CROSS_COEF: 0.75             # weight of cross-agent PPO term
+CROSS_SAMPLES: 512            # per agent, per minibatch (drawn from others)
 CROSS_RHO_MAX: 10.0    
 
 # env specific, see https://envpool.readthedocs.io/en/latest/env/atari.html
