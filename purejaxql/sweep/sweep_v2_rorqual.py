@@ -11,8 +11,8 @@ def gen_command(config):
 def run_random_job(fake_submit: bool = True):
     hparams = {
         'entropy_coef': [0.005],
-        'diversity_coef': [0.005, 0.007, 0.01],
-        'mixing_steps': [100, 200, 300],
+        'diversity_coef': [0.001,0.005, 0.007, 0.01],
+        'mixing_steps': [20, 50, 100, 200, 300],
         'tau': [0.001, 0.005, 0.01],
         'lr': [0.00025, 0.00015],
         'accum_steps': [3, 4],
