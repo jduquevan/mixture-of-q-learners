@@ -26,8 +26,8 @@ MIX_TAU: 0.01
 
 # cross agent sample use
 CROSS_AGENT_REUSE: true      # turn on/off
-CROSS_COEF: 0.75             # weight of cross-agent PPO term
-CROSS_SAMPLES: 512            # per agent, per minibatch (drawn from others)
+CROSS_COEF: 0.25             # weight of cross-agent PPO term
+CROSS_SAMPLES: 256            # per agent, per minibatch (drawn from others)
 CROSS_RHO_MAX: 10.0    
 
 # env specific, see https://envpool.readthedocs.io/en/latest/env/atari.html
