@@ -673,6 +673,12 @@ def make_train(config):
                     idx = jax.random.choice(rng_div, obs_pool.shape[0], (S,), replace=False)
                     div_obs = obs_pool[idx]
 
+                    adv_pool = advantage.reshape(A * B)
+                    adv_div  = adv_pool[idx]
+                    beta  = float(config.get("DIV_ADV_BETA", 1.0))
+                    raw_w = jnp.exp(-beta * jnp.abs(adv_div))
+                    w_div = raw_w / (jnp.mean(raw_w) + 1e-8)      
+
                     # encode once (no grad to encoder for diversity)
                     div_feats = network.apply({"params": encoder_train_states.params},
                                             div_obs, train=False, method=ActorCritic.encode)
@@ -705,7 +711,7 @@ def make_train(config):
                     rng_crosses = jax.random.split(rng_cross, A)
 
                     def agent_loss_and_update(cts, ats, minibatch, target, ets, logprobs_all, adv_i, i, ce_mask,
-                          flat_obs, flat_act, flat_logp, flat_adv, flat_agent, rng_cross,
+                          w_div, flat_obs, flat_act, flat_logp, flat_adv, flat_agent, rng_cross,
                           CROSS_ON, CROSS_COEF, CROSS_S, RHO_MAX):
                         # Critic loss and update
                         def _critic_loss_fn(critic_params, encoder_params):
@@ -762,7 +768,7 @@ def make_train(config):
                             denom = jnp.maximum(sum_w, 1.0)
 
                             mean_logp_others = (w[:, None, None] * logprobs_all).sum(axis=0) / denom
-                            ce_mean = -jnp.mean(jnp.sum(probs_div * mean_logp_others, axis=-1))
+                            ce_mean = -jnp.mean(w_div * jnp.sum(probs_div * mean_logp_others, axis=-1))
 
                             # div_coef_i = jnp.where(is_exempt, 0.0, div_coef)
                             cross_pg = 0.0
@@ -817,12 +823,12 @@ def make_train(config):
                     
                     critic_loss, actor_loss, entropies, kls, new_actor_train_states, critic_grads, encoder_c_grad, encoder_a_grad = jax.vmap(
                         agent_loss_and_update,
-                        in_axes=(None, 0, 0, 0, None, None, 0, 0, 0,
+                        in_axes=(None, 0, 0, 0, None, None, 0, 0, 0, None,
                                 None, None, None, None, None, 0,
                                 None, None, None, None)
                     )(
                         critic_train_states, actor_train_states, minibatch, target, encoder_train_states,
-                        logprobs_all, advantage, agent_ids, cross_entropy_mask,
+                        logprobs_all, advantage, agent_ids, cross_entropy_mask, w_div,
                         flat_obs, flat_act, flat_logp, flat_adv, flat_agent, rng_crosses,
                         CROSS_ON, CROSS_COEF, CROSS_S, RHO_MAX
                     )
@@ -945,8 +951,8 @@ def make_train(config):
                 # new_actor_states  = jax.vmap(_reset_opt)(
                 #     actor_train_states.replace(
                 #         params      = actor_pack,
-                #         opt_state   = actor_pack_opt,
                 #         mix_counter = jnp.zeros_like(actor_train_states.mix_counter),
+                #         grad_steps  = jnp.zeros_like(actor_train_states.grad_steps),
                 #     )
                 # )
 
@@ -955,12 +961,21 @@ def make_train(config):
                     opt_state   = actor_pack_opt,
                     mix_counter = jnp.zeros_like(actor_train_states.mix_counter),
                 )
-                return new_actor_states
+
+                ema_w_train = jnp.tensordot(w, critic_train_states.ema_train_return, axes=1)  
+                ema_w_test = jnp.tensordot(w, critic_train_states.ema_return, axes=1)  
+
+                new_critic_states = critic_train_states.replace(
+                    mix_counter=jnp.zeros_like(critic_train_states.mix_counter),
+                    ema_train_return=jnp.full_like(critic_train_states.ema_train_return, ema_w_train),
+                    ema_return=jnp.full_like(critic_train_states.ema_return, ema_w_test),
+                )
+                return new_actor_states, new_critic_states 
 
             def _skip_states(_):
-                return actor_train_states
+                return actor_train_states, critic_train_states 
 
-            actor_train_states = jax.lax.cond(
+            actor_train_states, critic_train_states = jax.lax.cond(
                 do_mix, _mix_states, _skip_states, operand=None
             )
             tau = config.get("MIX_TAU", 2.0)
