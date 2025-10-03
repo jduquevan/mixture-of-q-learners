@@ -39,6 +39,7 @@ TAU=${5}
 LR=${6}
 ACCUM_STEPS=${7}
 CROSS_COEF=${8}
+DIV_ADV_BETA=${9}
 
 # Construct the full command
 CMD="CUDA_VISIBLE_DEVICES=0 python  /project/rrg-bengioy-ad/jduque/mixture-of-q-learners/purejaxql/ppomix_se.py \
@@ -50,6 +51,7 @@ CMD="CUDA_VISIBLE_DEVICES=0 python  /project/rrg-bengioy-ad/jduque/mixture-of-q-
     alg.LR=${LR} \
     alg.ACCUM_STEPS=${ACCUM_STEPS} \
     alg.CROSS_COEF=${CROSS_COEF} \
+    alg.DIV_ADV_BETA=${DIV_ADV_BETA} \
     alg.NUM_ENVS=128 \
     alg.NUM_AGENTS=4 \
     alg.ENV_NAME=Gravitar-v5"

@@ -11,12 +11,13 @@ def gen_command(config):
 def run_random_job(fake_submit: bool = True):
     hparams = {
         'entropy_coef': [0.005],
-        'diversity_coef': [0.001,0.005, 0.007, 0.01],
-        'mixing_steps': [20, 50, 100, 200, 300],
-        'tau': [0.001, 0.005, 0.01],
-        'lr': [0.00025, 0.00015],
-        'accum_steps': [3, 4],
-        'cross_coeff': [0.25, 0.5, 0.75, 1],
+        'diversity_coef': [0.001, 0.003, 0.005],
+        'mixing_steps': [50, 100, 200],
+        'tau': [0.001, 0.003, 0.005],
+        'lr': [0.00015],
+        'accum_steps': [3],
+        'cross_coeff': [0.25, 0.5],
+        'div_adv_beta': [-0.15, 0.15, 0.2, 0.25, 0.3, 0.35],
     }
 
     # sample a random config
